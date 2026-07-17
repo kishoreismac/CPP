@@ -1,0 +1,15 @@
+services:
+  api:
+    build: ./apps/api
+    ports: ["5090:8080"]
+    environment:
+      ConnectionStrings__Cpp: Data Source=/data/cpp.db
+      MockJde__FailSubmissions: ${MOCK_JDE_FAILURE:-false}
+    volumes: ["cpp-data:/data"]
+  web:
+    build:
+      context: ./apps/web
+      args: { VITE_API_URL: "http://localhost:5090/api" }
+    ports: ["5173:80"]
+    depends_on: [api]
+volumes: { cpp-data: {} }
