@@ -67,7 +67,7 @@ jobs:
         run: dotnet build apps/api/Cpp.Api.csproj --configuration Release --no-restore
 
       - name: Test API
-        run: dotnet test --configuration Release --no-build
+        run: dotnet test apps/api/Cpp.Api.csproj --configuration Release --no-build
 
   deploy:
     name: Build images and deploy
