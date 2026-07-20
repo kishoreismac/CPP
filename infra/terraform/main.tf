@@ -70,6 +70,7 @@ resource "azurerm_linux_web_app" "api" {
     minimum_tls_version                     = "1.2"
     ftps_state                              = "Disabled"
     health_check_path                       = "/health"
+    health_check_eviction_time_in_min       = 5
 
     application_stack {
       docker_image_name   = "cpp-api:${var.api_image_tag}"
@@ -117,6 +118,7 @@ resource "azurerm_linux_web_app" "web" {
     minimum_tls_version                     = "1.2"
     ftps_state                              = "Disabled"
     health_check_path                       = "/"
+    health_check_eviction_time_in_min       = 5
 
     application_stack {
       docker_image_name   = "cpp-web:${var.web_image_tag}"
