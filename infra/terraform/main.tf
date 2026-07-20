@@ -82,7 +82,7 @@ resource "azurerm_linux_web_app" "api" {
     WEBSITES_PORT                         = "8080"
     WEBSITES_ENABLE_APP_SERVICE_STORAGE   = "true"
     ASPNETCORE_ENVIRONMENT                = "Production"
-    ConnectionStrings__Cpp                = "Data Source=/home/data/cpp.db"
+    ConnectionStrings__Cpp                = "Data Source=/home/cpp.db"
     Cors__AllowedOrigins__0               = "https://${azurerm_linux_web_app.web.default_hostname}"
     MockJde__FailSubmissions              = tostring(var.mock_jde_fail_submissions)
     APPLICATIONINSIGHTS_CONNECTION_STRING = azurerm_application_insights.main.connection_string
