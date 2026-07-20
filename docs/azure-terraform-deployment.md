@@ -112,6 +112,8 @@ $apiUrl = terraform output -raw api_url
 
 ## 9. Build and push containers
 
+The preferred deployment path is `.github/workflows/app-azure.yml`. It validates both projects, builds immutable API and web images using ACR Tasks, updates both Web Apps, restarts them, and performs live health/API/web smoke tests. Run **Build and Deploy Application** with the target environment after infrastructure has been applied.
+
 Use an immutable tag such as a commit SHA or release number. The web image requires the final API URL at build time because Vite substitutes it into the browser bundle.
 
 Using ACR Tasks avoids requiring a local Docker daemon:

@@ -1,0 +1,181 @@
+name: Build and Deploy Application
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "apps/**"
+      - ".github/workflows/app-azure.yml"
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Azure environment to deploy
+        required: true
+        default: dev
+        type: choice
+        options:
+          - dev
+          - test
+          - qa
+          - prod
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: app-deploy-${{ inputs.environment || 'dev' }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Build and test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+
+      - name: Install .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Install frontend dependencies
+        working-directory: apps/web
+        run: npm ci
+
+      - name: Check frontend
+        working-directory: apps/web
+        run: npm run format && npm run lint && npm run test && npm run build
+
+      - name: Restore API
+        run: dotnet restore apps/api/Cpp.Api.csproj
+
+      - name: Check API formatting
+        run: dotnet format apps/api/Cpp.Api.csproj --verify-no-changes --no-restore
+
+      - name: Build API
+        run: dotnet build apps/api/Cpp.Api.csproj --configuration Release --no-restore
+
+      - name: Test API
+        run: dotnet test --configuration Release --no-build
+
+  deploy:
+    name: Build images and deploy
+    needs: validate
+    runs-on: ubuntu-latest
+    environment: azure-infra
+    env:
+      DEPLOY_ENVIRONMENT: ${{ inputs.environment || 'dev' }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Azure with OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Resolve Azure resources
+        id: azure
+        shell: bash
+        run: |
+          set -euo pipefail
+          resource_group="$(az group list \
+            --query "[?tags.application=='CPP Order Management Portal' && tags.environment=='${DEPLOY_ENVIRONMENT}'].name | [0]" \
+            --output tsv)"
+          if [[ -z "$resource_group" ]]; then
+            echo "No Terraform-managed CPP resource group was found for ${DEPLOY_ENVIRONMENT}." >&2
+            exit 1
+          fi
+
+          acr_name="$(az acr list --resource-group "$resource_group" --query '[0].name' --output tsv)"
+          acr_server="$(az acr show --name "$acr_name" --query loginServer --output tsv)"
+          api_app="$(az webapp list --resource-group "$resource_group" --query "[?starts_with(name, 'api-')].name | [0]" --output tsv)"
+          web_app="$(az webapp list --resource-group "$resource_group" --query "[?starts_with(name, 'web-')].name | [0]" --output tsv)"
+          api_host="$(az webapp show --resource-group "$resource_group" --name "$api_app" --query defaultHostName --output tsv)"
+          web_host="$(az webapp show --resource-group "$resource_group" --name "$web_app" --query defaultHostName --output tsv)"
+
+          for value in "$acr_name" "$acr_server" "$api_app" "$web_app" "$api_host" "$web_host"; do
+            if [[ -z "$value" ]]; then
+              echo "An expected Azure application resource could not be resolved." >&2
+              exit 1
+            fi
+          done
+
+          echo "resource_group=$resource_group" >> "$GITHUB_OUTPUT"
+          echo "acr_name=$acr_name" >> "$GITHUB_OUTPUT"
+          echo "acr_server=$acr_server" >> "$GITHUB_OUTPUT"
+          echo "api_app=$api_app" >> "$GITHUB_OUTPUT"
+          echo "web_app=$web_app" >> "$GITHUB_OUTPUT"
+          echo "api_url=https://$api_host" >> "$GITHUB_OUTPUT"
+          echo "web_url=https://$web_host" >> "$GITHUB_OUTPUT"
+
+      - name: Build API image in ACR
+        run: |
+          az acr build \
+            --registry "${{ steps.azure.outputs.acr_name }}" \
+            --image "cpp-api:${GITHUB_SHA}" \
+            --image "cpp-api:latest" \
+            --file apps/api/Dockerfile \
+            apps/api
+
+      - name: Build web image in ACR
+        run: |
+          az acr build \
+            --registry "${{ steps.azure.outputs.acr_name }}" \
+            --image "cpp-web:${GITHUB_SHA}" \
+            --image "cpp-web:latest" \
+            --build-arg "VITE_API_URL=${{ steps.azure.outputs.api_url }}/api" \
+            --file apps/web/Dockerfile \
+            apps/web
+
+      - name: Deploy immutable images
+        run: |
+          az webapp config container set \
+            --resource-group "${{ steps.azure.outputs.resource_group }}" \
+            --name "${{ steps.azure.outputs.api_app }}" \
+            --container-image-name "${{ steps.azure.outputs.acr_server }}/cpp-api:${GITHUB_SHA}" \
+            --container-registry-url "https://${{ steps.azure.outputs.acr_server }}" \
+            --output none
+          az webapp config container set \
+            --resource-group "${{ steps.azure.outputs.resource_group }}" \
+            --name "${{ steps.azure.outputs.web_app }}" \
+            --container-image-name "${{ steps.azure.outputs.acr_server }}/cpp-web:${GITHUB_SHA}" \
+            --container-registry-url "https://${{ steps.azure.outputs.acr_server }}" \
+            --output none
+          az webapp restart --resource-group "${{ steps.azure.outputs.resource_group }}" --name "${{ steps.azure.outputs.api_app }}"
+          az webapp restart --resource-group "${{ steps.azure.outputs.resource_group }}" --name "${{ steps.azure.outputs.web_app }}"
+
+      - name: Smoke test deployment
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error \
+            --retry 30 --retry-delay 10 --retry-all-errors \
+            "${{ steps.azure.outputs.api_url }}/health"
+          curl --fail --silent --show-error \
+            --retry 12 --retry-delay 10 --retry-all-errors \
+            "${{ steps.azure.outputs.api_url }}/api/accounts" >/dev/null
+          curl --fail --silent --show-error \
+            --retry 20 --retry-delay 10 --retry-all-errors \
+            "${{ steps.azure.outputs.web_url }}" >/dev/null
+
+      - name: Publish deployment summary
+        run: |
+          echo "### Application deployment" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Commit: \`${GITHUB_SHA}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Web: ${{ steps.azure.outputs.web_url }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- API: ${{ steps.azure.outputs.api_url }}" >> "$GITHUB_STEP_SUMMARY"
