@@ -14,7 +14,7 @@ This topology is appropriate for a demonstration, QA environment, or low-volume 
 | ASP.NET Core listens on port 8080 in its Dockerfile | A second Linux Web App runs `cpp-api` with `WEBSITES_PORT=8080` |
 | The browser calls an absolute `VITE_API_URL` baked into the web bundle | The web image must be built after the API hostname is known |
 | API CORS previously allowed only localhost | `Cors__AllowedOrigins__0` supplies the deployed web origin; `Program.cs` now reads configurable origins |
-| EF Core uses SQLite and calls `EnsureCreated()` at startup | The connection string points to `/home/data/cpp.db`, and App Service persistent storage is enabled |
+| EF Core uses SQLite and calls `EnsureCreated()` at startup | The connection string points to `/home/cpp.db`, and App Service persistent storage is enabled |
 | There is no external identity, cache, queue, or real JDE integration | No Entra app registration, Redis, Service Bus, or private integration resource is provisioned |
 | API exposes `/health` and web root returns the SPA | App Service health checks use `/health` and `/` respectively |
 | The API emits console logs and correlation response headers | App Service diagnostic logs and metrics are routed to Log Analytics |
@@ -153,7 +153,7 @@ Expected results:
 - API health returns HTTP 200 and `{ "status": "Healthy" }`.
 - Web root returns HTTP 200.
 - The browser can load accounts and orders without a CORS error.
-- Creating a draft creates `/home/data/cpp.db` on the API Web App.
+- Creating a draft creates `/home/cpp.db` on the API Web App.
 
 OpenAPI is currently mapped only in the ASP.NET `Development` environment, so `/openapi/v1.json` is intentionally unavailable in this deployment.
 
@@ -178,7 +178,7 @@ Key runtime settings applied to the API:
 |---|---|
 | `WEBSITES_PORT` | `8080` |
 | `WEBSITES_ENABLE_APP_SERVICE_STORAGE` | `true`, required for SQLite persistence |
-| `ConnectionStrings__Cpp` | `Data Source=/home/data/cpp.db` |
+| `ConnectionStrings__Cpp` | `Data Source=/home/cpp.db` |
 | `Cors__AllowedOrigins__0` | HTTPS hostname of the web app |
 | `ASPNETCORE_ENVIRONMENT` | `Production` |
 | `MockJde__FailSubmissions` | Failure simulation switch |
@@ -218,7 +218,7 @@ Diagnostic table names can vary with Azure diagnostic mode and provider behavior
 The database is stored on persistent App Service storage, but persistence is not a backup strategy. Before meaningful use:
 
 - Enable scheduled App Service backups to a separate storage account, or implement SQLite-aware backups.
-- Include `/home/data` in the backup scope.
+- Include `/home/cpp.db` in the backup scope.
 - Define retention and test restoration into a separate environment.
 - Never copy a live SQLite file naively while writes are occurring; use SQLite's backup mechanism or a coordinated application stop/checkpoint.
 - Treat the application as recovery-sensitive because orders and audit events share the same file.
