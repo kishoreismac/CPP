@@ -57,3 +57,25 @@ test("Ship-To change replaces Deliver-To choices", async ({ page }) => {
     page.getByTestId("deliver-to").locator("option", { hasText: "Boonville" }),
   ).toHaveCount(0);
 });
+test("General Orders and Order History display complete order details", async ({
+  page,
+}) => {
+  await page.goto("/orders/general");
+  await expect(page.getByRole("heading", { name: "General Orders" })).toBeVisible();
+  await expect(page.getByText("ORDER2001", { exact: true })).toBeVisible();
+  await expect(page.getByText("Submitted", { exact: true }).first()).toBeVisible();
+
+  await page.goto("/orders/history");
+  await expect(page.getByRole("heading", { name: "Order History" })).toBeVisible();
+  await expect(page.getByText("DRAFT1001", { exact: true })).toBeVisible();
+  await expect(page.getByRole("link", { name: "Edit" }).first()).toBeVisible();
+});
+test("Accounts list opens an existing account for editing", async ({ page }) => {
+  await page.goto("/accounts");
+  await expect(page.getByRole("heading", { name: "Customer Accounts" })).toBeVisible();
+  await expect(page.getByText("MFA-ADRIAN", { exact: true })).toBeVisible();
+  await expect(page.getByRole("link", { name: "Create Account" })).toBeVisible();
+  await page.getByRole("link", { name: "View / Edit" }).first().click();
+  await expect(page.getByRole("heading", { name: "View / Edit Account" })).toBeVisible();
+  await expect(page.getByLabel("Account Name *")).toHaveValue("MFA-ADRIAN");
+});
