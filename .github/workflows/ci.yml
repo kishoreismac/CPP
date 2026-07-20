@@ -16,5 +16,5 @@ jobs:
       - run: dotnet restore apps/api/Cpp.Api.csproj
       - run: dotnet format apps/api/Cpp.Api.csproj --verify-no-changes --no-restore
       - run: dotnet build apps/api/Cpp.Api.csproj --no-restore
-      - run: dotnet test --no-build
+      - run: dotnet test apps/api/Cpp.Api.csproj --no-build
       - run: docker compose build

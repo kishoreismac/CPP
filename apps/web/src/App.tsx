@@ -65,6 +65,17 @@ function App() {
           <Routes>
             <Route path="/" element={<Navigate to="/command-center" />} />
             <Route path="/command-center" element={<CommandCenter />} />
+            <Route
+              path="/orders/general"
+              element={<OrderHistoryPage title="General Orders" />}
+            />
+            <Route
+              path="/orders/history"
+              element={<OrderHistoryPage title="Order History" />}
+            />
+            <Route path="/accounts" element={<AccountsPage />} />
+            <Route path="/accounts/new" element={<AccountEditor />} />
+            <Route path="/accounts/:accountId" element={<AccountEditor />} />
             <Route path="/crop-protection/orders" element={<Orders />} />
             <Route
               path="/crop-protection/orders/new"
@@ -126,13 +137,8 @@ function Shell({ children }: { children: React.ReactNode }) {
           >
             Crop Protection <ChevronDown size={14} />
           </button>
-          {[
-            "Account",
-            "Emulation",
-            "Prepay",
-            "Partner Websites",
-            "Programs",
-          ].map((x) => (
+          <Link to="/accounts">Account</Link>
+          {["Emulation", "Prepay", "Partner Websites", "Programs"].map((x) => (
             <Link key={x} to={`/section/${encodeURIComponent(x)}`}>
               {x}
             </Link>
@@ -164,10 +170,10 @@ function Shell({ children }: { children: React.ReactNode }) {
         {menu === "orders" && (
           <div className="order-menu" onMouseLeave={() => setMenu(null)}>
             <b>Orders</b>
-            <Link onClick={() => setMenu(null)} to="/section/General Orders">
+            <Link onClick={() => setMenu(null)} to="/orders/general">
               General Orders
             </Link>
-            <Link onClick={() => setMenu(null)} to="/section/Order History">
+            <Link onClick={() => setMenu(null)} to="/orders/history">
               Order History
             </Link>
           </div>
@@ -492,6 +498,366 @@ function Orders() {
           <span>
             1–{rows.length} of {data.length}
           </span>
+        </div>
+      </section>
+    </>
+  );
+}
+type HistoryOrder = {
+  id: string;
+  webOrderNumber?: string;
+  status: string;
+  customerPo?: string;
+  createdAt: string;
+  updatedAt: string;
+  submittedAt?: string;
+  account?: Account;
+  products: {
+    productId: string;
+    name: string;
+    quantity: number;
+    uom: string;
+    unitPrice: number;
+    total: number;
+  }[];
+  totalQuantity: number;
+  totalAmount: number;
+  canEdit: boolean;
+};
+function OrderHistoryPage({ title }: { title: string }) {
+  const [q, setQ] = useState("");
+  const {
+    data = [],
+    isLoading,
+    isError,
+    refetch,
+  } = useQuery<HistoryOrder[]>({
+    queryKey: ["complete-order-history"],
+    queryFn: () => api("/orders"),
+  });
+  const normalized = q.trim().toLowerCase();
+  const rows = data.filter(
+    (order) =>
+      !normalized ||
+      `${order.id} ${order.webOrderNumber ?? ""} ${order.customerPo ?? ""} ${order.account?.name ?? ""} ${order.status} ${order.products.map((p) => p.name).join(" ")}`
+        .toLowerCase()
+        .includes(normalized),
+  );
+  return (
+    <>
+      <PageTitle
+        actions={
+          <Link className="button primary" to="/crop-protection/orders/new">
+            <Plus size={17} /> Create New Order
+          </Link>
+        }
+      >
+        {title}
+      </PageTitle>
+      <section className="panel">
+        <div className="searchbar">
+          <input
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+            placeholder="Search order, account, PO, status, or product"
+            aria-label="Search complete order history"
+          />
+          <button className="primary">
+            <Search size={16} /> Search
+          </button>
+          <a className="button" href={`${API}/orders/export`}>
+            <Download size={16} /> Export
+          </a>
+        </div>
+        {isLoading ? (
+          <Skeleton />
+        ) : isError ? (
+          <Empty
+            text="Order history could not be loaded."
+            action={<button onClick={() => refetch()}>Retry</button>}
+          />
+        ) : rows.length === 0 ? (
+          <Empty text="No orders match your search." />
+        ) : (
+          <Table>
+            <thead>
+              <tr>
+                <th>Order Number</th>
+                <th>Date</th>
+                <th>Account</th>
+                <th>Products</th>
+                <th>Quantity</th>
+                <th>Total Amount</th>
+                <th>Status</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((order) => (
+                <tr key={order.id}>
+                  <td>
+                    <b>{order.webOrderNumber ?? order.id}</b>
+                    {order.webOrderNumber && <small>{order.id}</small>}
+                  </td>
+                  <td>
+                    {new Date(
+                      order.submittedAt ?? order.updatedAt,
+                    ).toLocaleDateString()}
+                  </td>
+                  <td>
+                    {order.account?.name ?? "Unknown account"}
+                    <small>{order.account?.accountNumber}</small>
+                  </td>
+                  <td>
+                    {order.products.length
+                      ? order.products.map((product) => (
+                          <small key={product.productId}>
+                            {product.name} — {product.quantity} {product.uom}
+                          </small>
+                        ))
+                      : "No product lines"}
+                  </td>
+                  <td>{order.totalQuantity}</td>
+                  <td>{money.format(order.totalAmount)}</td>
+                  <td>
+                    <Status value={order.status} />
+                  </td>
+                  <td>
+                    <Link
+                      to={
+                        order.canEdit
+                          ? `/crop-protection/orders/${order.id}/edit`
+                          : `/crop-protection/orders/${order.id}`
+                      }
+                    >
+                      {order.canEdit ? "Edit" : "View"}
+                    </Link>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </Table>
+        )}
+        <p className="notice">
+          Submitted, submitting, and cancelled orders are read-only. Drafts and
+          recoverable failed orders remain editable.
+        </p>
+      </section>
+    </>
+  );
+}
+type AccountDraft = Omit<Account, "id">;
+const blankAccount: AccountDraft = {
+  accountNumber: "",
+  name: "",
+  address: "",
+  city: "",
+  state: "MO",
+  postalCode: "",
+  soldToName: "",
+  contactEmail: "",
+  shippingInstructions: "",
+  requiresCustomerPo: false,
+};
+function AccountsPage() {
+  const [q, setQ] = useState("");
+  const {
+    data = [],
+    isLoading,
+    isError,
+    refetch,
+  } = useQuery<Account[]>({
+    queryKey: ["accounts"],
+    queryFn: () => api("/accounts"),
+  });
+  const rows = data.filter((account) =>
+    `${account.name} ${account.accountNumber} ${account.city} ${account.state} ${account.postalCode}`
+      .toLowerCase()
+      .includes(q.trim().toLowerCase()),
+  );
+  return (
+    <>
+      <PageTitle
+        actions={
+          <Link className="button primary" to="/accounts/new">
+            <Plus size={17} /> Create Account
+          </Link>
+        }
+      >
+        Customer Accounts
+      </PageTitle>
+      <section className="panel">
+        <div className="searchbar">
+          <input
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+            placeholder="Search name, account number, city, state, or postal code"
+            aria-label="Search accounts"
+          />
+          <button className="primary">
+            <Search size={16} /> Search
+          </button>
+        </div>
+        {isLoading ? (
+          <Skeleton />
+        ) : isError ? (
+          <Empty
+            text="Accounts could not be loaded."
+            action={<button onClick={() => refetch()}>Retry</button>}
+          />
+        ) : rows.length === 0 ? (
+          <Empty text="No customer accounts match your search." />
+        ) : (
+          <Table>
+            <thead>
+              <tr>
+                <th>Account</th>
+                <th>Sold To</th>
+                <th>Address</th>
+                <th>Contact</th>
+                <th>PO Requirement</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((account) => (
+                <tr key={account.id}>
+                  <td>
+                    <b>{account.name}</b>
+                    <small>{account.accountNumber}</small>
+                  </td>
+                  <td>{account.soldToName}</td>
+                  <td>
+                    {account.address}
+                    <small>
+                      {account.city}, {account.state} {account.postalCode}
+                    </small>
+                  </td>
+                  <td>{account.contactEmail || "Not supplied"}</td>
+                  <td>
+                    {account.requiresCustomerPo ? "Required" : "Optional"}
+                  </td>
+                  <td>
+                    <Link to={`/accounts/${account.id}`}>View / Edit</Link>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </Table>
+        )}
+      </section>
+    </>
+  );
+}
+function AccountEditor() {
+  const { accountId } = useParams();
+  const nav = useNavigate();
+  const query = useQueryClient();
+  const [draft, setDraft] = useState<AccountDraft>(blankAccount);
+  const [attempted, setAttempted] = useState(false);
+  const existing = useQuery<Account>({
+    queryKey: ["account", accountId],
+    queryFn: () => api(`/accounts/${accountId}`),
+    enabled: !!accountId,
+  });
+  useEffect(() => {
+    if (existing.data) {
+      const { id: _id, ...account } = existing.data;
+      void _id;
+      setDraft(account);
+    }
+  }, [existing.data]);
+  const valid =
+    !!draft.accountNumber.trim() &&
+    !!draft.name.trim() &&
+    !!draft.address.trim() &&
+    !!draft.city.trim() &&
+    !!draft.state.trim() &&
+    !!draft.postalCode.trim() &&
+    !!draft.soldToName.trim() &&
+    (!draft.contactEmail || draft.contactEmail.includes("@"));
+  const save = useMutation({
+    mutationFn: () =>
+      api<Account>(accountId ? `/accounts/${accountId}` : "/accounts", {
+        method: accountId ? "PUT" : "POST",
+        body: JSON.stringify(draft),
+      }),
+    onSuccess: (account) => {
+      query.invalidateQueries({ queryKey: ["accounts"] });
+      query.setQueryData(["account", account.id], account);
+      nav("/accounts");
+    },
+  });
+  if (accountId && existing.isLoading) return <Skeleton />;
+  return (
+    <>
+      <PageTitle>
+        {accountId ? "View / Edit Account" : "Create Account"}
+      </PageTitle>
+      <section className="panel form">
+        <div className="grid">
+          {(
+            [
+              ["accountNumber", "Account Number *"],
+              ["name", "Account Name *"],
+              ["soldToName", "Sold-To Name *"],
+              ["address", "Street Address *"],
+              ["city", "City *"],
+              ["state", "State *"],
+              ["postalCode", "Postal Code *"],
+              ["contactEmail", "Contact Email"],
+            ] as [keyof AccountDraft, string][]
+          ).map(([key, label]) => (
+            <label key={key}>
+              {label}
+              <input
+                value={String(draft[key])}
+                onChange={(e) => setDraft({ ...draft, [key]: e.target.value })}
+              />
+            </label>
+          ))}
+          <label className="wide">
+            Shipping Instructions
+            <textarea
+              value={draft.shippingInstructions}
+              onChange={(e) =>
+                setDraft({ ...draft, shippingInstructions: e.target.value })
+              }
+            />
+          </label>
+          <label className="check">
+            <input
+              type="checkbox"
+              checked={draft.requiresCustomerPo}
+              onChange={(e) =>
+                setDraft({ ...draft, requiresCustomerPo: e.target.checked })
+              }
+            />{" "}
+            Customer PO is required
+          </label>
+        </div>
+        {attempted && !valid && (
+          <p className="error" role="alert">
+            Complete all required fields and enter a valid contact email.
+          </p>
+        )}
+        {save.isError && (
+          <p className="error" role="alert">
+            {save.error.message}
+          </p>
+        )}
+        <div className="footer">
+          <button onClick={() => nav("/accounts")}>Cancel</button>
+          <button
+            className="primary"
+            disabled={save.isPending}
+            onClick={() => {
+              setAttempted(true);
+              if (valid) save.mutate();
+            }}
+          >
+            {accountId ? "Save Changes" : "Create Account"}
+          </button>
         </div>
       </section>
     </>
