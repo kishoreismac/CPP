@@ -1,0 +1,189 @@
+name: Azure Infrastructure
+
+on:
+  pull_request:
+    paths:
+      - "infra/terraform/**"
+      - ".github/workflows/infra-azure.yml"
+  workflow_dispatch:
+    inputs:
+      action:
+        description: Terraform action
+        required: true
+        default: plan
+        type: choice
+        options:
+          - plan
+          - apply
+          - destroy
+      environment:
+        description: Deployment environment
+        required: true
+        default: dev
+        type: choice
+        options:
+          - dev
+          - test
+          - qa
+          - prod
+      api_image_tag:
+        description: API container image tag
+        required: true
+        default: latest
+        type: string
+      web_image_tag:
+        description: Web container image tag
+        required: true
+        default: latest
+        type: string
+      confirm_destroy:
+        description: Type DESTROY to authorize resource destruction
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: azure-infra-${{ inputs.environment || 'dev' }}
+  cancel-in-progress: false
+
+env:
+  TF_IN_AUTOMATION: true
+  TF_INPUT: false
+  TF_ROOT: infra/terraform
+  TF_VAR_subscription_id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+  TF_VAR_environment: ${{ inputs.environment || 'dev' }}
+  TF_VAR_api_image_tag: ${{ inputs.api_image_tag || 'latest' }}
+  TF_VAR_web_image_tag: ${{ inputs.web_image_tag || 'latest' }}
+
+jobs:
+  terraform:
+    name: Terraform ${{ inputs.action || 'plan' }}
+    runs-on: ubuntu-latest
+    environment: azure-infra
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Azure with OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.6
+          terraform_wrapper: false
+
+      - name: Bootstrap remote state
+        id: state
+        shell: bash
+        env:
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        run: |
+          set -euo pipefail
+          compact_subscription="${AZURE_SUBSCRIPTION_ID//-/}"
+          state_account="stcpp${compact_subscription:0:18}"
+          state_group="rg-cpp-terraform-state"
+          state_container="tfstate"
+
+          az group create --name "$state_group" --location centralindia --output none
+          if ! az storage account show --name "$state_account" --resource-group "$state_group" >/dev/null 2>&1; then
+            az storage account create \
+              --name "$state_account" \
+              --resource-group "$state_group" \
+              --location centralindia \
+              --sku Standard_LRS \
+              --kind StorageV2 \
+              --min-tls-version TLS1_2 \
+              --allow-blob-public-access false \
+              --output none
+          fi
+
+          state_key_value="$(az storage account keys list --account-name "$state_account" --resource-group "$state_group" --query '[0].value' -o tsv)"
+          echo "::add-mask::$state_key_value"
+          az storage container create \
+            --name "$state_container" \
+            --account-name "$state_account" \
+            --account-key "$state_key_value" \
+            --output none
+
+          echo "account=$state_account" >> "$GITHUB_OUTPUT"
+          echo "group=$state_group" >> "$GITHUB_OUTPUT"
+          echo "container=$state_container" >> "$GITHUB_OUTPUT"
+          echo "access_key=$state_key_value" >> "$GITHUB_OUTPUT"
+
+      - name: Terraform format
+        working-directory: ${{ env.TF_ROOT }}
+        run: terraform fmt -check -recursive
+
+      - name: Terraform initialize
+        working-directory: ${{ env.TF_ROOT }}
+        env:
+          ARM_ACCESS_KEY: ${{ steps.state.outputs.access_key }}
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ steps.state.outputs.group }}" \
+            -backend-config="storage_account_name=${{ steps.state.outputs.account }}" \
+            -backend-config="container_name=${{ steps.state.outputs.container }}" \
+            -backend-config="key=cpp-order/${TF_VAR_environment}.tfstate"
+
+      - name: Terraform validate
+        working-directory: ${{ env.TF_ROOT }}
+        run: terraform validate
+
+      - name: Reject unauthorized destroy
+        if: inputs.action == 'destroy' && inputs.confirm_destroy != 'DESTROY'
+        run: |
+          echo "Destroy requires confirm_destroy=DESTROY" >&2
+          exit 1
+
+      - name: Terraform plan
+        working-directory: ${{ env.TF_ROOT }}
+        env:
+          ARM_ACCESS_KEY: ${{ steps.state.outputs.access_key }}
+        run: |
+          if [[ "${{ inputs.action }}" == "destroy" ]]; then
+            terraform plan -destroy -out=tfplan
+          else
+            terraform plan -out=tfplan
+          fi
+
+      - name: Upload Terraform plan
+        if: always() && hashFiles('infra/terraform/tfplan') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-plan-${{ inputs.environment || 'dev' }}
+          path: infra/terraform/tfplan
+          retention-days: 7
+
+      - name: Terraform apply
+        if: inputs.action == 'apply'
+        working-directory: ${{ env.TF_ROOT }}
+        env:
+          ARM_ACCESS_KEY: ${{ steps.state.outputs.access_key }}
+        run: terraform apply -auto-approve tfplan
+
+      - name: Terraform destroy
+        if: inputs.action == 'destroy' && inputs.confirm_destroy == 'DESTROY'
+        working-directory: ${{ env.TF_ROOT }}
+        env:
+          ARM_ACCESS_KEY: ${{ steps.state.outputs.access_key }}
+        run: terraform apply -auto-approve tfplan
+
+      - name: Deployment outputs
+        if: inputs.action == 'apply'
+        working-directory: ${{ env.TF_ROOT }}
+        env:
+          ARM_ACCESS_KEY: ${{ steps.state.outputs.access_key }}
+        run: |
+          echo "### Azure infrastructure" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Web: $(terraform output -raw web_url)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- API: $(terraform output -raw api_url)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Resource group: $(terraform output -raw resource_group_name)" >> "$GITHUB_STEP_SUMMARY"

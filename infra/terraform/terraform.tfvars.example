@@ -1,0 +1,12 @@
+subscription_id  = "00000000-0000-0000-0000-000000000000"
+location         = "centralindia"
+environment      = "dev"
+name_prefix      = "cpp-order"
+app_service_sku  = "B1"
+api_image_tag    = "2026.07.20.1"
+web_image_tag    = "2026.07.20.1"
+
+tags = {
+  owner       = "platform-team"
+  cost-center = "demo"
+}
