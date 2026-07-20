@@ -4,6 +4,7 @@
     <TargetFramework>net10.0</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
+    <UserSecretsId>cpp-api-agent-secrets-9b4c6d57</UserSecretsId>
   </PropertyGroup>
 
   <ItemGroup>

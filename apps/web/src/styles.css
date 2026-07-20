@@ -632,9 +632,24 @@ td small {
   border-radius: 8px;
   background: #edf3f2;
 }
+.meta {
+  display: block;
+  margin-top: 6px;
+  color: #5f6f74;
+}
 .chat-log .user {
   background: var(--light);
   margin-left: 45px;
+}
+.assistant-block {
+  margin-top: 8px;
+  padding: 8px;
+  border: 1px dashed var(--border);
+  background: #fff;
+}
+.assistant-block small {
+  display: block;
+  margin-top: 4px;
 }
 .sku {
   border: 1px solid var(--border);
@@ -644,6 +659,11 @@ td small {
 }
 .sku small {
   display: block;
+}
+.assistant-actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
 }
 .quick {
   align-self: flex-start;

@@ -105,3 +105,71 @@ export type Validation = {
   field?: string;
   suggestedResolution?: string;
 };
+
+export type AssistantChatMessage = {
+  role: "assistant" | "user";
+  text: string;
+};
+
+export type AssistantRequest = {
+  message: string;
+  conversationId?: string;
+  orderId?: string;
+  history?: AssistantChatMessage[];
+  contextEntities?: Record<string, string | null>;
+};
+
+export type AssistantMissingField = {
+  field: string;
+  whyRequired: string;
+  clarificationPrompt: string;
+};
+
+export type AssistantToolCall = {
+  name: string;
+  reason: string;
+  arguments: Record<string, string | null>;
+};
+
+export type AssistantGrounding = {
+  source: string;
+  identifier: string;
+  evidence: string;
+};
+
+export type AssistantResponse = {
+  conversationId: string;
+  status: "Complete" | "NeedsClarification" | "Unsupported" | "Blocked" | "Escalated";
+  intent: string;
+  confidence: number;
+  reply: string;
+  entities: Record<string, string | null>;
+  missingFields: AssistantMissingField[];
+  clarificationQuestions: string[];
+  toolCalls: AssistantToolCall[];
+  grounding: AssistantGrounding[];
+  products: Product[];
+  escalate: boolean;
+  escalationReason?: string;
+  unsupportedReason?: string;
+  policy: {
+    promptInjectionDetected: boolean;
+    usedApprovedToolsOnly: boolean;
+    transactionControlKeptInApplication: boolean;
+    authenticationMode: string;
+    blockReason?: string;
+  };
+  version: {
+    modelVersion: string;
+    promptVersion: string;
+    instructionVersion: string;
+  };
+  trace: {
+    traceId: string;
+    startedAtUtc: string;
+    completedAtUtc: string;
+    historyMessageCount: number;
+    inputHash: string;
+    outcome: string;
+  };
+};
