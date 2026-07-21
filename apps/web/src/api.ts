@@ -139,7 +139,8 @@ export type AssistantGrounding = {
 
 export type AssistantResponse = {
   conversationId: string;
-  status: "Complete" | "NeedsClarification" | "Unsupported" | "Blocked" | "Escalated";
+  status:
+    "Complete" | "NeedsClarification" | "Unsupported" | "Blocked" | "Escalated";
   intent: string;
   confidence: number;
   reply: string;

@@ -1,23 +1,25 @@
 namespace Cpp.Api;
 
-public enum AssistantIntent {
-  Greeting,
-  CreateOrder,
-  FindProduct,
-  UpdateOrderLine,
-  UpdateShipping,
-  ReviewDraft,
-  SubmitOrder,
-  Unsupported,
-  Unknown
+public enum AssistantIntent
+{
+    Greeting,
+    CreateOrder,
+    FindProduct,
+    UpdateOrderLine,
+    UpdateShipping,
+    ReviewDraft,
+    SubmitOrder,
+    Unsupported,
+    Unknown
 }
 
-public enum AssistantStatus {
-  Complete,
-  NeedsClarification,
-  Unsupported,
-  Blocked,
-  Escalated
+public enum AssistantStatus
+{
+    Complete,
+    NeedsClarification,
+    Unsupported,
+    Blocked,
+    Escalated
 }
 
 public record AssistantChatMessage(string Role, string Text);

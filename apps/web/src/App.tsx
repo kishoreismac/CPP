@@ -2166,7 +2166,9 @@ function Assistant() {
   const query = useQueryClient();
   const [open, setOpen] = useState(false);
   const [conversationId, setConversationId] = useState<string | undefined>();
-  const [contextEntities, setContextEntities] = useState<Record<string, string | null>>({});
+  const [contextEntities, setContextEntities] = useState<
+    Record<string, string | null>
+  >({});
   const [messages, setMessages] = useState<
     {
       role: "assistant" | "user";
@@ -2185,7 +2187,9 @@ function Assistant() {
     },
   ]);
   const [text, setText] = useState("");
-  const orderIdMatch = location.pathname.match(/\/crop-protection\/orders\/([^/]+)/);
+  const orderIdMatch = location.pathname.match(
+    /\/crop-protection\/orders\/([^/]+)/,
+  );
   const orderId = orderIdMatch?.[1];
 
   const send = useMutation({
@@ -2288,7 +2292,9 @@ function Assistant() {
                     </small>
                   </div>
                 ))}
-                {m.traceId && <small className="meta">Trace: {m.traceId}</small>}
+                {m.traceId && (
+                  <small className="meta">Trace: {m.traceId}</small>
+                )}
               </div>
             ))}
           </div>
