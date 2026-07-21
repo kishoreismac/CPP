@@ -3,7 +3,14 @@ using Microsoft.EntityFrameworkCore;
 using System.Text.Json.Serialization;
 var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddDbContext<AppDb>(o => o.UseSqlite(builder.Configuration.GetConnectionString("Cpp") ?? "Data Source=cpp-v3.db"));
+builder.Services.AddMemoryCache();
 builder.Services.AddScoped<IOrderRuleService, OrderRuleService>(); builder.Services.AddSingleton<IFulfillmentGateway, MockJdeFulfillmentGateway>();
+builder.Services.AddHttpClient<IAssistantAgentService, AssistantAgentService>((sp, http) =>
+{
+    var cfg = sp.GetRequiredService<IConfiguration>();
+    var timeoutSeconds = cfg.GetValue<int?>("Agent:RequestTimeoutSeconds") ?? 45;
+    http.Timeout = TimeSpan.FromSeconds(Math.Max(10, timeoutSeconds));
+});
 builder.Services.AddControllers().AddJsonOptions(o => o.JsonSerializerOptions.Converters.Add(new JsonStringEnumConverter())); builder.Services.AddOpenApi();
 var allowedOrigins = builder.Configuration.GetSection("Cors:AllowedOrigins").Get<string[]>()
     ?? ["http://localhost:5173", "http://127.0.0.1:5173"];

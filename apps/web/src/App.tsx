@@ -35,6 +35,10 @@ import {
   api,
   API,
   type Account,
+  type AssistantMissingField,
+  type AssistantRequest,
+  type AssistantResponse,
+  type AssistantToolCall,
   type DeliverTo,
   type AlternateDelivery,
   type Product,
@@ -2158,25 +2162,74 @@ function Confirmation() {
   );
 }
 function Assistant() {
+  const location = useLocation();
+  const query = useQueryClient();
   const [open, setOpen] = useState(false);
+  const [conversationId, setConversationId] = useState<string | undefined>();
+  const [contextEntities, setContextEntities] = useState<
+    Record<string, string | null>
+  >({});
   const [messages, setMessages] = useState<
-    { role: string; text: string; products?: Product[] }[]
+    {
+      role: "assistant" | "user";
+      text: string;
+      products?: Product[];
+      status?: string;
+      missingFields?: AssistantMissingField[];
+      clarificationQuestions?: string[];
+      toolCalls?: AssistantToolCall[];
+      traceId?: string;
+    }[]
   >([
-    { role: "assistant", text: "Hello Riley! What can I help you with today?" },
+    {
+      role: "assistant",
+      text: "I can help classify CPP ordering requests, extract entities, and prepare clarification questions before you continue in the order flow.",
+    },
   ]);
   const [text, setText] = useState("");
+  const orderIdMatch = location.pathname.match(
+    /\/crop-protection\/orders\/([^/]+)/,
+  );
+  const orderId = orderIdMatch?.[1];
+
   const send = useMutation({
-    mutationFn: (message: string) =>
-      api<any>("/assistant/messages", {
+    mutationFn: (message: string) => {
+      const request: AssistantRequest = {
+        message,
+        conversationId,
+        orderId,
+        history: messages.map((m) => ({ role: m.role, text: m.text })),
+        contextEntities,
+      };
+      return api<AssistantResponse>("/agent/messages", {
         method: "POST",
-        body: JSON.stringify({ message }),
-      }),
-    onSuccess: (r) =>
+        body: JSON.stringify(request),
+      });
+    },
+    onSuccess: (r) => {
+      setConversationId(r.conversationId);
+      if (r.status === "Complete" && r.intent === "SubmitOrder") {
+        query.invalidateQueries({ queryKey: ["orders"] });
+        setContextEntities({});
+      } else {
+        setContextEntities(r.entities);
+      }
       setMessages((m) => [
         ...m,
-        { role: "assistant", text: r.reply, products: r.products },
-      ]),
+        {
+          role: "assistant",
+          text: r.reply,
+          products: r.products,
+          status: r.status,
+          missingFields: r.missingFields,
+          clarificationQuestions: r.clarificationQuestions,
+          toolCalls: r.toolCalls,
+          traceId: r.trace.traceId,
+        },
+      ]);
+    },
   });
+
   function go(v = text) {
     if (!v.trim()) return;
     setMessages((m) => [...m, { role: "user", text: v }]);
@@ -2204,6 +2257,33 @@ function Assistant() {
             {messages.map((m, i) => (
               <div className={m.role} key={i}>
                 {m.text}
+                {m.status && <small className="meta">Status: {m.status}</small>}
+                {!!m.missingFields?.length && (
+                  <div className="assistant-block">
+                    <b>Missing fields</b>
+                    {m.missingFields.map((item) => (
+                      <small key={item.field}>
+                        {item.field}: {item.clarificationPrompt}
+                      </small>
+                    ))}
+                  </div>
+                )}
+                {!!m.clarificationQuestions?.length && (
+                  <div className="assistant-block">
+                    <b>Clarification questions</b>
+                    {m.clarificationQuestions.map((q) => (
+                      <small key={q}>{q}</small>
+                    ))}
+                  </div>
+                )}
+                {!!m.toolCalls?.length && (
+                  <div className="assistant-block">
+                    <b>Approved tools used</b>
+                    {m.toolCalls.map((tool, index) => (
+                      <small key={`${tool.name}-${index}`}>{tool.name}</small>
+                    ))}
+                  </div>
+                )}
                 {m.products?.map((p) => (
                   <div className="sku" key={p.id}>
                     <b>{p.name}</b>
@@ -2212,11 +2292,28 @@ function Assistant() {
                     </small>
                   </div>
                 ))}
+                {m.traceId && (
+                  <small className="meta">Trace: {m.traceId}</small>
+                )}
               </div>
             ))}
           </div>
-          <button className="quick" onClick={() => go("Create CPP Order")}>
-            Create CPP Order
+          <div className="assistant-actions">
+            <button
+              className="quick"
+              onClick={() => go("Create CPP Order for Adrian with glyphosate")}
+            >
+              Start Draft
+            </button>
+            <button
+              className="quick"
+              onClick={() => go("Find glyphosate products")}
+            >
+              Find Glyphosate
+            </button>
+          </div>
+          <button className="quick" onClick={() => go("Review my draft order")}>
+            Review Draft
           </button>
           <div className="inline">
             <input
