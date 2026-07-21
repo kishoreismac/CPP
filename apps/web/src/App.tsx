@@ -30,12 +30,18 @@ import {
   AlertTriangle,
   Printer,
   Minus,
+  ShoppingCart,
+  Pencil,
+  Truck,
+  FileText,
+  RotateCcw,
 } from "lucide-react";
 import {
   api,
   API,
   type Account,
   type AssistantMissingField,
+  type AssistantOrderLine,
   type AssistantRequest,
   type AssistantResponse,
   type AssistantToolCall,
@@ -57,6 +63,34 @@ const future = () => {
   d.setDate(d.getDate() + 7);
   return d.toISOString().slice(0, 10);
 };
+const assistantStarters = [
+  {
+    label: "Find glyphosate products",
+    detail: "Show matching products and availability",
+    prompt: "Find all glyphosate products currently available in the catalog.",
+    kind: "search",
+  },
+  {
+    label: "Find products starting with THU",
+    detail: "Search the full catalog by product name",
+    prompt: "Show all products whose names start with THU.",
+    kind: "search",
+  },
+  {
+    label: "Draft a Gallatin order",
+    detail: "CORNERSTONE 5 PLUS · 10 units",
+    prompt:
+      "Create a draft order for 10 units of CORNERSTONE 5 PLUS using the MFA-GALLATIN account, delivered to Gallatin Bulk Facility. Let me review it before submission.",
+    kind: "order",
+  },
+  {
+    label: "Draft a Boonville order",
+    detail: "AZOXYSTROBIN 2SC · 20 units · PO included",
+    prompt:
+      "Create a draft order for 20 units of AZOXYSTROBIN 2SC using the MFA-BOONVILLE account, delivered to Boonville Bulk Facility, with customer PO 595468768. Let me review it before submission.",
+    kind: "order",
+  },
+];
 function App() {
   return (
     <QueryClientProvider client={qc}>
@@ -2169,6 +2203,9 @@ function Assistant() {
   const [contextEntities, setContextEntities] = useState<
     Record<string, string | null>
   >({});
+  const [contextOrderLines, setContextOrderLines] = useState<
+    AssistantOrderLine[]
+  >([]);
   const [messages, setMessages] = useState<
     {
       role: "assistant" | "user";
@@ -2178,12 +2215,16 @@ function Assistant() {
       missingFields?: AssistantMissingField[];
       clarificationQuestions?: string[];
       toolCalls?: AssistantToolCall[];
+      intent?: string;
+      entities?: Record<string, string | null>;
+      orderLines?: AssistantOrderLine[];
+      grounding?: AssistantResponse["grounding"];
       traceId?: string;
     }[]
   >([
     {
       role: "assistant",
-      text: "I can help classify CPP ordering requests, extract entities, and prepare clarification questions before you continue in the order flow.",
+      text: "I can find products, prepare CPP orders, and keep the order ready for your review before submission.",
     },
   ]);
   const [text, setText] = useState("");
@@ -2200,6 +2241,7 @@ function Assistant() {
         orderId,
         history: messages.map((m) => ({ role: m.role, text: m.text })),
         contextEntities,
+        contextOrderLines,
       };
       return api<AssistantResponse>("/agent/messages", {
         method: "POST",
@@ -2211,8 +2253,10 @@ function Assistant() {
       if (r.status === "Complete" && r.intent === "SubmitOrder") {
         query.invalidateQueries({ queryKey: ["orders"] });
         setContextEntities({});
+        setContextOrderLines([]);
       } else {
         setContextEntities(r.entities);
+        setContextOrderLines(r.orderLines ?? []);
       }
       setMessages((m) => [
         ...m,
@@ -2224,6 +2268,10 @@ function Assistant() {
           missingFields: r.missingFields,
           clarificationQuestions: r.clarificationQuestions,
           toolCalls: r.toolCalls,
+          intent: r.intent,
+          entities: r.entities,
+          orderLines: r.orderLines,
+          grounding: r.grounding,
           traceId: r.trace.traceId,
         },
       ]);
@@ -2256,65 +2304,104 @@ function Assistant() {
           <div className="chat-log">
             {messages.map((m, i) => (
               <div className={m.role} key={i}>
-                {m.text}
-                {m.status && <small className="meta">Status: {m.status}</small>}
-                {!!m.missingFields?.length && (
-                  <div className="assistant-block">
-                    <b>Missing fields</b>
-                    {m.missingFields.map((item) => (
-                      <small key={item.field}>
-                        {item.field}: {item.clarificationPrompt}
+                {m.intent === "FindProduct" && m.products?.length
+                  ? `Found ${m.products.length} matching product${m.products.length === 1 ? "" : "s"}. Select a product or tell me which item and quantity you want.`
+                  : m.text}
+                {m.intent !== "FindProduct" &&
+                  !!m.clarificationQuestions?.length && (
+                    <div className="assistant-block">
+                      <b>Needed to continue</b>
+                      {m.clarificationQuestions.map((q) => (
+                        <small key={q}>{q}</small>
+                      ))}
+                    </div>
+                  )}
+                {m.intent === "FindProduct" &&
+                  m.products?.map((p) => (
+                    <div className="sku" key={p.id}>
+                      <div className="sku-head">
+                        <b>{p.name}</b>
+                        <span
+                          className={`sku-status ${p.stoplightStatus.toLowerCase()}`}
+                        >
+                          {p.stoplightStatus}
+                        </span>
+                      </div>
+                      <small>
+                        {p.itemNumber} · {p.packageSize}
                       </small>
-                    ))}
-                  </div>
-                )}
-                {!!m.clarificationQuestions?.length && (
-                  <div className="assistant-block">
-                    <b>Clarification questions</b>
-                    {m.clarificationQuestions.map((q) => (
-                      <small key={q}>{q}</small>
-                    ))}
-                  </div>
-                )}
-                {!!m.toolCalls?.length && (
-                  <div className="assistant-block">
-                    <b>Approved tools used</b>
-                    {m.toolCalls.map((tool, index) => (
-                      <small key={`${tool.name}-${index}`}>{tool.name}</small>
-                    ))}
-                  </div>
-                )}
-                {m.products?.map((p) => (
-                  <div className="sku" key={p.id}>
-                    <b>{p.name}</b>
-                    <small>
-                      {p.itemNumber} · {p.packageSize}
-                    </small>
-                  </div>
-                ))}
-                {m.traceId && (
-                  <small className="meta">Trace: {m.traceId}</small>
+                    </div>
+                  ))}
+                {m.entities &&
+                  m.status !== "Complete" &&
+                  hasOrderReviewDetails(m.entities, m.orderLines) && (
+                    <AssistantOrderReview
+                      entities={m.entities}
+                      orderLines={m.orderLines ?? []}
+                      missingFields={m.missingFields ?? []}
+                      hasOutstandingQuestions={Boolean(
+                        m.clarificationQuestions?.length,
+                      )}
+                      busy={send.isPending}
+                      onConfirm={() =>
+                        go(
+                          "Confirm and submit this order using the reviewed details.",
+                        )
+                      }
+                      onEdit={() => setText("Change the order so that ")}
+                      onAddProduct={() =>
+                        go("I want to add another product to this order.")
+                      }
+                    />
+                  )}
+                {m.status === "Complete" && m.intent === "SubmitOrder" && (
+                  <AssistantOrderConfirmation
+                    text={m.text}
+                    grounding={m.grounding ?? []}
+                    onNewOrder={() => {
+                      setContextEntities({});
+                      setContextOrderLines([]);
+                      go("Start a new CPP order.");
+                    }}
+                  />
                 )}
               </div>
             ))}
+            {messages.length === 1 && (
+              <section
+                className="assistant-starters"
+                aria-label="Starter questions"
+              >
+                <div className="assistant-starters-head">
+                  <b>Try asking</b>
+                  <small>Choose an example for a quick result</small>
+                </div>
+                <div className="assistant-starter-grid">
+                  {assistantStarters.map((starter) => (
+                    <button
+                      key={starter.label}
+                      disabled={send.isPending}
+                      onClick={() => go(starter.prompt)}
+                    >
+                      <span
+                        className={`assistant-starter-icon ${starter.kind}`}
+                      >
+                        {starter.kind === "search" ? (
+                          <Search size={16} />
+                        ) : (
+                          <ShoppingCart size={16} />
+                        )}
+                      </span>
+                      <span>
+                        <b>{starter.label}</b>
+                        <small>{starter.detail}</small>
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              </section>
+            )}
           </div>
-          <div className="assistant-actions">
-            <button
-              className="quick"
-              onClick={() => go("Create CPP Order for Adrian with glyphosate")}
-            >
-              Start Draft
-            </button>
-            <button
-              className="quick"
-              onClick={() => go("Find glyphosate products")}
-            >
-              Find Glyphosate
-            </button>
-          </div>
-          <button className="quick" onClick={() => go("Review my draft order")}>
-            Review Draft
-          </button>
           <div className="inline">
             <input
               aria-label="Assistant message"
@@ -2328,6 +2415,204 @@ function Assistant() {
         </section>
       )}
     </div>
+  );
+}
+
+function firstEntity(
+  entities: Record<string, string | null>,
+  ...keys: string[]
+) {
+  for (const key of keys) {
+    const value = entities[key];
+    if (value?.trim()) return value.trim();
+  }
+  return undefined;
+}
+
+function hasOrderReviewDetails(
+  entities: Record<string, string | null>,
+  orderLines?: AssistantOrderLine[],
+) {
+  const product = firstEntity(
+    entities,
+    "productName",
+    "itemNumber",
+    "productId",
+  );
+  const quantity = firstEntity(entities, "quantity");
+  const account = firstEntity(entities, "shipToAccountName", "shipToAccountId");
+  const hasLines = Boolean(orderLines?.some((line) => line.quantity > 0));
+  return Boolean(account && (hasLines || (product && quantity)));
+}
+
+function AssistantOrderReview({
+  entities,
+  orderLines,
+  missingFields,
+  hasOutstandingQuestions,
+  busy,
+  onConfirm,
+  onEdit,
+  onAddProduct,
+}: {
+  entities: Record<string, string | null>;
+  orderLines: AssistantOrderLine[];
+  missingFields: AssistantMissingField[];
+  hasOutstandingQuestions: boolean;
+  busy: boolean;
+  onConfirm: () => void;
+  onEdit: () => void;
+  onAddProduct: () => void;
+}) {
+  const product = firstEntity(
+    entities,
+    "productName",
+    "itemNumber",
+    "productId",
+  );
+  const itemNumber = firstEntity(entities, "itemNumber");
+  const quantity = firstEntity(entities, "quantity");
+  const account = firstEntity(entities, "shipToAccountName", "shipToAccountId");
+  const delivery = firstEntity(entities, "deliverToName", "deliverToId");
+  const customerPo = firstEntity(entities, "customerPo");
+  const reviewLines = orderLines.length
+    ? orderLines
+    : [
+        {
+          productName: product,
+          itemNumber,
+          quantity: Number(quantity),
+        },
+      ];
+  const ready =
+    missingFields.length === 0 &&
+    !hasOutstandingQuestions &&
+    Boolean(delivery) &&
+    reviewLines.every(
+      (line) =>
+        line.quantity > 0 &&
+        Boolean(line.productName || line.itemNumber || line.productId),
+    );
+
+  return (
+    <section className="assistant-order-card" aria-label="Order review">
+      <div className="assistant-order-head">
+        <span className="assistant-order-icon">
+          <ShoppingCart size={17} />
+        </span>
+        <div>
+          <small>Review before submission</small>
+          <b>Order details captured</b>
+        </div>
+        <span className={`assistant-ready ${ready ? "ready" : "incomplete"}`}>
+          {ready ? "Ready" : "Needs details"}
+        </span>
+      </div>
+      <div className="assistant-order-account">
+        <Truck size={15} />
+        <span>
+          <small>Ship-to account</small>
+          <b>{account}</b>
+        </span>
+      </div>
+      <div className="assistant-order-lines">
+        {reviewLines.map((line, index) => {
+          const lineName =
+            line.productName || line.itemNumber || line.productId;
+          return (
+            <div
+              className="assistant-order-line"
+              key={`${line.productId ?? line.itemNumber ?? lineName}-${index}`}
+            >
+              <div>
+                <small>
+                  {reviewLines.length > 1 ? `Product ${index + 1}` : "Product"}
+                </small>
+                <b>{lineName}</b>
+                {line.itemNumber && lineName !== line.itemNumber && (
+                  <em>#{line.itemNumber}</em>
+                )}
+              </div>
+              <div>
+                <small>Quantity</small>
+                <b>{line.quantity}</b>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+      <dl className="assistant-order-facts">
+        <div>
+          <dt>Delivery</dt>
+          <dd>{delivery ?? "Not selected"}</dd>
+        </div>
+        {customerPo && (
+          <div>
+            <dt>Customer PO</dt>
+            <dd>{customerPo}</dd>
+          </div>
+        )}
+      </dl>
+      {!ready && (
+        <p className="assistant-order-note">
+          Complete the outstanding details before submitting this order.
+        </p>
+      )}
+      <div className="assistant-order-buttons">
+        <button
+          className="primary"
+          disabled={!ready || busy}
+          onClick={onConfirm}
+        >
+          <CheckCircle2 size={15} /> Confirm order
+        </button>
+        <button disabled={busy} onClick={onEdit}>
+          <Pencil size={15} /> Edit
+        </button>
+        <button disabled={busy} onClick={onAddProduct}>
+          <Plus size={15} /> Add product
+        </button>
+      </div>
+    </section>
+  );
+}
+
+function AssistantOrderConfirmation({
+  text,
+  grounding,
+  onNewOrder,
+}: {
+  text: string;
+  grounding: AssistantResponse["grounding"];
+  onNewOrder: () => void;
+}) {
+  const webOrder = text.match(/WEB-[A-Z0-9-]+/i)?.[0];
+  const orderId = grounding.find((item) => item.source === "order")?.identifier;
+
+  return (
+    <section className="assistant-confirm-card" aria-label="Order confirmed">
+      <div className="assistant-confirm-mark">
+        <CheckCircle2 size={21} />
+      </div>
+      <div className="assistant-confirm-copy">
+        <small>Submission complete</small>
+        <b>Order confirmed</b>
+        <span>{webOrder ?? "Confirmation created"}</span>
+      </div>
+      <div className="assistant-confirm-actions">
+        {orderId && (
+          <Link to={`/crop-protection/orders/${orderId}`}>
+            <FileText size={15} /> View order
+          </Link>
+        )}
+        <Link to="/crop-protection/orders">
+          <Truck size={15} /> Track orders
+        </Link>
+        <button onClick={onNewOrder}>
+          <RotateCcw size={15} /> New order
+        </button>
+      </div>
+    </section>
   );
 }
 function Section() {

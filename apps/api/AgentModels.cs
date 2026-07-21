@@ -24,12 +24,20 @@ public enum AssistantStatus
 
 public record AssistantChatMessage(string Role, string Text);
 
+public record AssistantOrderLine(
+  string? ProductId,
+  string? ItemNumber,
+  string? ProductName,
+  int Quantity
+);
+
 public record AssistantRequest(
   string Message,
   string? ConversationId,
   string? OrderId,
   List<AssistantChatMessage>? History = null,
-  Dictionary<string, string?>? ContextEntities = null
+  Dictionary<string, string?>? ContextEntities = null,
+  List<AssistantOrderLine>? ContextOrderLines = null
 );
 
 public record AssistantMissingField(string Field, string WhyRequired, string ClarificationPrompt);
@@ -74,7 +82,8 @@ public record AssistantResponse(
   string? UnsupportedReason,
   AssistantPolicyResult Policy,
   AssistantVersionInfo Version,
-  AssistantTrace Trace
+  AssistantTrace Trace,
+  IReadOnlyList<AssistantOrderLine>? OrderLines = null
 );
 
 public record AssistantHealthResponse(

@@ -28,6 +28,7 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
         var conversationId = string.IsNullOrWhiteSpace(request.ConversationId) ? Guid.NewGuid().ToString("N") : request.ConversationId.Trim();
         var message = request.Message?.Trim() ?? string.Empty;
         var stateKey = $"assistant-entities:{conversationId}";
+        var linesStateKey = $"assistant-order-lines:{conversationId}";
         var conversationEntities = memory.Get<Dictionary<string, string?>>(stateKey) is { } saved
           ? new Dictionary<string, string?>(saved, StringComparer.OrdinalIgnoreCase)
           : new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
@@ -36,7 +37,17 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
             if (string.IsNullOrWhiteSpace(entity.Value)) conversationEntities.Remove(entity.Key);
             else conversationEntities[entity.Key] = entity.Value;
         }
-        var effectiveRequest = request with { ConversationId = conversationId, ContextEntities = conversationEntities };
+        var conversationOrderLines = request.ContextOrderLines is not null
+          ? new List<AssistantOrderLine>(request.ContextOrderLines)
+          : memory.Get<List<AssistantOrderLine>>(linesStateKey) is { } savedLines
+            ? new List<AssistantOrderLine>(savedLines)
+            : [];
+        var effectiveRequest = request with
+        {
+            ConversationId = conversationId,
+            ContextEntities = conversationEntities,
+            ContextOrderLines = conversationOrderLines
+        };
         var inputHash = Hash(message);
         var version = GetVersionInfo();
         var approvedTools = GetApprovedTools();
@@ -100,6 +111,21 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
         }
 
         var modelToolCalls = modelOutput.ToolCalls ?? [];
+        if (!modelToolCalls.Any(t => string.Equals(t.Name, "search_products", StringComparison.OrdinalIgnoreCase))
+            && ParseIntent(modelOutput.Intent) == AssistantIntent.FindProduct
+            && modelOutput.Policy?.PromptInjectionDetected != true
+            && !string.IsNullOrWhiteSpace(modelOutput.SearchQuery))
+        {
+            modelToolCalls.Add(new ModelToolCall
+            {
+                Name = "search_products",
+                Reason = "Application-orchestrated catalog lookup from the model's structured FindProduct decision.",
+                Arguments = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["query"] = modelOutput.SearchQuery.Trim()
+                }
+            });
+        }
         if (!modelToolCalls.Any(t => string.Equals(t.Name, "place_order", StringComparison.OrdinalIgnoreCase))
             && ParseIntent(modelOutput.Intent) == AssistantIntent.SubmitOrder
             && modelOutput.Policy?.PromptInjectionDetected != true
@@ -120,6 +146,71 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
 
         var toolResults = await ExecuteToolCallsAsync(acceptedToolCalls, ct);
 
+        var lookupToolCalls = acceptedToolCalls
+          .Where(c => !string.Equals(c.Name, "place_order", StringComparison.OrdinalIgnoreCase))
+          .ToList();
+        if (lookupToolCalls.Count > 0)
+        {
+            var executedToolResults = new
+            {
+                instructions = "Generate the final user-facing response from these executed database results. Do not repeat lookup tool calls. Never claim that a product is absent unless the catalog-search result reports zero matches.",
+                calls = lookupToolCalls,
+                products = toolResults.Products.Select(p => new
+                {
+                    p.Id,
+                    p.ItemNumber,
+                    p.Name,
+                    p.ActiveIngredients,
+                    p.Supplier,
+                    p.PackageSize,
+                    p.Uom,
+                    p.Orderable,
+                    p.StoplightStatus
+                }),
+                grounding = toolResults.Grounding
+            };
+
+            try
+            {
+                var followupOutput = await GetModelDecisionAsync(effectiveRequest, contextSnapshot, apiConfig, ct, executedToolResults);
+                var followupToolCalls = followupOutput.ToolCalls ?? [];
+                modelToolCalls.AddRange(followupToolCalls);
+                acceptedToolCalls.AddRange(followupToolCalls
+                  .Where(t => string.Equals(t.Name, "place_order", StringComparison.OrdinalIgnoreCase)
+                    && approvedTools.Contains(t.Name, StringComparer.OrdinalIgnoreCase))
+                  .Select(t => new AssistantToolCall(
+                    t.Name,
+                    t.Reason ?? "Model-requested tool call after grounded lookup",
+                    new Dictionary<string, string?>(t.Arguments, StringComparer.OrdinalIgnoreCase))));
+                modelOutput = followupOutput;
+            }
+            catch (Exception ex)
+            {
+                return BuildResponse(
+                  conversationId,
+                  AssistantStatus.Escalated,
+                  AssistantIntent.Unknown,
+                  0,
+                  "The catalog lookup completed, but the AI provider could not generate a grounded response. Please retry.",
+                  conversationEntities,
+                  [],
+                  [],
+                  lookupToolCalls,
+                  toolResults.Grounding,
+                  toolResults.Products,
+                  true,
+                  TrimForAudit(ex.Message),
+                  null,
+                  new AssistantPolicyResult(false, true, true, "api-key", TrimForAudit(ex.Message)),
+                  version,
+                  startedAt,
+                  request.History?.Count ?? 0,
+                  inputHash,
+                  "escalated"
+                );
+            }
+        }
+
         var grounding = new List<AssistantGrounding>();
         if (modelOutput.Grounding is not null)
         {
@@ -128,6 +219,18 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
               .Select(g => new AssistantGrounding(g.Source, g.Identifier, g.Evidence ?? string.Empty)));
         }
         grounding.AddRange(toolResults.Grounding);
+
+        var orderLines = (modelOutput.OrderLines ?? [])
+          .Where(line => line.Quantity > 0
+            && (!string.IsNullOrWhiteSpace(line.ProductId)
+              || !string.IsNullOrWhiteSpace(line.ItemNumber)
+              || !string.IsNullOrWhiteSpace(line.ProductName)))
+          .Select(line => new AssistantOrderLine(line.ProductId, line.ItemNumber, line.ProductName, line.Quantity))
+          .ToList();
+        if (orderLines.Count == 0)
+        {
+            orderLines = new List<AssistantOrderLine>(conversationOrderLines);
+        }
 
         var entities = new Dictionary<string, string?>(effectiveRequest.ContextEntities ?? new Dictionary<string, string?>(), StringComparer.OrdinalIgnoreCase);
         foreach (var entity in modelOutput.Entities ?? new Dictionary<string, string?>())
@@ -196,7 +299,7 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
             ));
         }
 
-        var placement = await TryPlaceOrderAsync(modelOutput, entities, acceptedToolCalls, ct);
+        var placement = await TryPlaceOrderAsync(entities, orderLines, acceptedToolCalls, ct);
         if (placement.Executed)
         {
             if (placement.Success)
@@ -244,6 +347,7 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
         if (placement.Success && intent == AssistantIntent.SubmitOrder)
         {
             memory.Remove(stateKey);
+            memory.Remove(linesStateKey);
         }
         else
         {
@@ -252,6 +356,7 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
               new Dictionary<string, string?>(entities, StringComparer.OrdinalIgnoreCase),
               TimeSpan.FromHours(2)
             );
+            memory.Set(linesStateKey, new List<AssistantOrderLine>(orderLines), TimeSpan.FromHours(2));
         }
 
         return BuildResponse(
@@ -274,7 +379,8 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
           startedAt,
           request.History?.Count ?? 0,
           inputHash,
-          status.ToString().ToLowerInvariant()
+          status.ToString().ToLowerInvariant(),
+          orderLines
         );
     }
 
@@ -381,12 +487,13 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
           .Take(6)
           .ToListAsync(ct);
 
-        var products = await db.Products
-          .AsNoTracking()
-          .OrderBy(x => x.Name)
-          .Select(x => new { x.Id, x.ItemNumber, x.Name, x.ActiveIngredients, x.Orderable, x.StoplightStatus })
-          .Take(12)
-          .ToListAsync(ct);
+        var productCatalog = new
+        {
+            TotalCount = await db.Products.AsNoTracking().CountAsync(ct),
+            SearchTool = "search_products",
+            SearchableFields = new[] { "name", "itemNumber", "activeIngredient" },
+            ResultPageSize = 20
+        };
 
         var deliveryLocations = await db.DeliverToLocations
           .AsNoTracking()
@@ -419,7 +526,7 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
         {
             approvedTools,
             accounts,
-            products,
+            productCatalog,
             deliveryLocations,
             order
         };
@@ -427,7 +534,7 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
         return JsonSerializer.Serialize(snapshot, JsonOptions);
     }
 
-    async Task<ModelOutput> GetModelDecisionAsync(AssistantRequest request, string contextSnapshot, AgentApiConfig apiConfig, CancellationToken ct)
+    async Task<ModelOutput> GetModelDecisionAsync(AssistantRequest request, string contextSnapshot, AgentApiConfig apiConfig, CancellationToken ct, object? executedToolResults = null)
     {
         var endpoint = $"{apiConfig.Endpoint}/openai/deployments/{apiConfig.Deployment}/chat/completions?api-version={apiConfig.ApiVersion}";
         var temperature = config.GetValue<double?>("Agent:Temperature") ?? 0.2;
@@ -436,7 +543,10 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
         var systemPrompt = config["Agent:SystemPrompt"] ??
           "You are a CPP ordering assistant. Interpret user intent from the entire conversation, including natural-language confirmations, corrections, and rejections. Always return valid JSON that matches the schema. Keep transaction control in application code. Never claim submission unless you emit place_order in the same response.";
         var instructionSet = config["Agent:InstructionSet"] ??
-          "Maintain structured order state across the conversation. Merge contextEntities with facts and corrections from the latest message, return the complete state every turn, and use only canonical keys: productId, itemNumber, productName, quantity, shipToAccountId, shipToAccountName, deliverToId, deliverToName, customerPo, freightOption. Normalize values against contextSnapshot. Resolve pronouns, ordinal choices, abbreviations, partial names, and prior-result references from conversation context. Never discard established facts when the user supplies another field. Ask only for facts unresolved after the merge. Unit of measure comes from the catalog. Decide authorization semantically and emit place_order with the complete state when authorized.";
+          "The catalog can be arbitrarily large. Always call search_products for product, SKU, availability, or active-ingredient questions. Never infer absence from contextSnapshot or claim not-found without an executed catalog search returning zero matches. When executedToolResults is present, answer only from those results and do not repeat lookup calls. Maintain structured order state across the conversation. Merge contextEntities with new facts and corrections, return the complete state every turn, and normalize canonical order entities against grounded results. Ask only for facts unresolved after the merge. Unit of measure comes from the catalog. Decide authorization semantically and emit place_order with the complete state when authorized.";
+        instructionSet += " For every product, SKU, availability, or active-ingredient lookup, set intent=FindProduct and searchQuery to only the most specific normalized catalog term inferred from the full conversation. Exclude conversational words such as find, show, products, and items from searchQuery. Never respond that a search is pending or that results will be provided later. When executedToolResults is present, retain searchQuery for traceability, do not request another lookup, and answer directly from the returned database results.";
+        instructionSet += " Maintain orderLines as the complete typed list of products currently in the draft. Each line must contain the canonical productId, itemNumber, productName, and quantity. When the user adds a product, append or merge that product without removing existing lines. When the user edits or removes a product, update only the referenced line. Always return every current line on subsequent turns, including turns that only provide shipping or PO information. Never emit place_order unless orderLines accurately represents everything shown in the review.";
+        instructionSet += " Completing or correcting order details is not submission authorization. After the final required detail is supplied, return intent=ReviewDraft with the complete entities and orderLines, no missing fields or clarification questions, readyForSubmission=true, and do not emit place_order. Keep the draft open so the user can review it, add products, or edit it. Emit intent=SubmitOrder and place_order only when the latest user turn explicitly confirms submission of the reviewed draft; infer that confirmation semantically rather than matching fixed phrases.";
 
         var userPayload = new
         {
@@ -445,7 +555,9 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
             orderId = request.OrderId,
             history = request.History,
             contextEntities = request.ContextEntities,
-            contextSnapshot
+            contextOrderLines = request.ContextOrderLines,
+            contextSnapshot,
+            executedToolResults
         };
 
         async Task<(bool Ok, int StatusCode, string Raw)> SendModelRequestAsync(object payload)
@@ -494,7 +606,7 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
                 max_tokens = maxTokens,
                 messages = new object[] {
           new { role = "system", content = systemPrompt },
-          new { role = "system", content = instructionSet + " Return only a single valid JSON object with keys: status,intent,confidence,reply,entities,missingFields,clarificationQuestions,toolCalls,grounding,escalate,escalationReason,unsupportedReason,readyForSubmission,policy." },
+          new { role = "system", content = instructionSet + " Return only a single valid JSON object with keys: status,intent,confidence,reply,searchQuery,entities,orderLines,missingFields,clarificationQuestions,toolCalls,grounding,escalate,escalationReason,unsupportedReason,readyForSubmission,policy." },
           new { role = "user", content = JsonSerializer.Serialize(userPayload, JsonOptions) }
         },
                 response_format = new { type = "json_object" }
@@ -528,19 +640,30 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
                 case "search_products":
                     {
                         var query = call.Arguments.TryGetValue("query", out var q) ? (q ?? string.Empty).Trim() : string.Empty;
-                        var data = await db.Products
-                          .AsNoTracking()
-                          .Where(p => string.IsNullOrWhiteSpace(query)
-                            || p.Name.Contains(query, StringComparison.OrdinalIgnoreCase)
-                            || p.ItemNumber.Contains(query, StringComparison.OrdinalIgnoreCase)
-                            || p.ActiveIngredients.Contains(query, StringComparison.OrdinalIgnoreCase))
+                        var productQuery = db.Products.AsNoTracking().AsQueryable();
+                        if (!string.IsNullOrWhiteSpace(query))
+                        {
+                            var pattern = $"%{EscapeLikePattern(query)}%";
+                            productQuery = productQuery.Where(p =>
+                              EF.Functions.Like(p.Name, pattern, "\\")
+                              || EF.Functions.Like(p.ItemNumber, pattern, "\\")
+                              || EF.Functions.Like(p.ActiveIngredients, pattern, "\\"));
+                        }
+
+                        var totalMatches = await productQuery.CountAsync(ct);
+                        var data = await productQuery
                           .OrderBy(p => p.Name)
-                          .Take(5)
+                          .Take(20)
                           .ToListAsync(ct);
                         products.AddRange(data);
+                        grounding.Add(new(
+                          "catalog-search",
+                          string.IsNullOrWhiteSpace(query) ? "all-products" : query,
+                          $"Database search matched {totalMatches} product(s); returned {data.Count}."
+                        ));
                         foreach (var product in data)
                         {
-                            grounding.Add(new("product", product.Id, $"{product.Name} ({product.ItemNumber})"));
+                            grounding.Add(new("product", product.Id, $"{product.Name} ({product.ItemNumber}); active ingredient: {product.ActiveIngredients}; availability: {product.StoplightStatus}."));
                         }
                         break;
                     }
@@ -644,7 +767,8 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
       DateTimeOffset startedAt,
       int historyCount,
       string inputHash,
-      string outcome
+      string outcome,
+      IReadOnlyList<AssistantOrderLine>? orderLines = null
     )
     {
         return new AssistantResponse(
@@ -671,7 +795,8 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
             historyCount,
             inputHash,
             outcome
-          )
+          ),
+          orderLines
         );
     }
 
@@ -724,11 +849,13 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
             Intent = GetString(root, "intent"),
             Confidence = GetDouble(root, "confidence"),
             Reply = GetString(root, "reply"),
+            SearchQuery = GetNullableString(root, "searchQuery"),
             Escalate = GetBool(root, "escalate"),
             EscalationReason = GetNullableString(root, "escalationReason"),
             UnsupportedReason = GetNullableString(root, "unsupportedReason"),
             ReadyForSubmission = GetBool(root, "readyForSubmission"),
             Entities = ParseEntities(root),
+            OrderLines = ParseOrderLines(root),
             MissingFields = ParseMissingFields(root),
             ClarificationQuestions = ParseClarificationQuestions(root),
             ToolCalls = ParseToolCalls(root),
@@ -737,6 +864,29 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
         };
 
         return output;
+    }
+
+    static List<ModelOrderLine> ParseOrderLines(JsonElement root)
+    {
+        var result = new List<ModelOrderLine>();
+        if (!root.TryGetProperty("orderLines", out var node) || node.ValueKind != JsonValueKind.Array)
+        {
+            return result;
+        }
+
+        foreach (var item in node.EnumerateArray())
+        {
+            if (item.ValueKind != JsonValueKind.Object) continue;
+            result.Add(new ModelOrderLine
+            {
+                ProductId = GetNullableString(item, "productId"),
+                ItemNumber = GetNullableString(item, "itemNumber"),
+                ProductName = GetNullableString(item, "productName"),
+                Quantity = (int)(GetDouble(item, "quantity") ?? 0)
+            });
+        }
+
+        return result;
     }
 
     static Dictionary<string, string?> ParseEntities(JsonElement root)
@@ -830,7 +980,7 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
         return result;
     }
 
-    async Task<OrderPlacementAttempt> TryPlaceOrderAsync(ModelOutput modelOutput, IReadOnlyDictionary<string, string?> entities, IReadOnlyList<AssistantToolCall> toolCalls, CancellationToken ct)
+    async Task<OrderPlacementAttempt> TryPlaceOrderAsync(IReadOnlyDictionary<string, string?> entities, IReadOnlyList<AssistantOrderLine> orderLines, IReadOnlyList<AssistantToolCall> toolCalls, CancellationToken ct)
     {
         var toolRequested = toolCalls.Any(t => string.Equals(t.Name, "place_order", StringComparison.OrdinalIgnoreCase));
         if (!toolRequested)
@@ -846,16 +996,42 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
             missing.Add(new AssistantMissingField("shipToAccount", "Ship-To account is required for order submission.", "Which account should be used for this order?"));
         }
 
-        var product = await ResolveProductAsync(entities, ct);
-        if (product is null)
+        var requestedLines = orderLines.Count > 0
+          ? orderLines.ToList()
+          : [new AssistantOrderLine(
+              FirstNonEmpty(entities, "productId"),
+              FirstNonEmpty(entities, "itemNumber", "sku"),
+              FirstNonEmpty(entities, "productName", "product"),
+              ResolveQuantity(entities) ?? 0)];
+        var resolvedLines = new List<(Product Product, int Quantity)>();
+        for (var index = 0; index < requestedLines.Count; index++)
         {
-            missing.Add(new AssistantMissingField("product", "A product SKU is required for order submission.", "Which product should be ordered?"));
-        }
-
-        var quantity = ResolveQuantity(entities);
-        if (quantity is null || quantity.Value <= 0)
-        {
-            missing.Add(new AssistantMissingField("quantity", "A valid quantity is required for order submission.", "How many units should be ordered?"));
+            var requestedLine = requestedLines[index];
+            var lineEntities = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["productId"] = requestedLine.ProductId,
+                ["itemNumber"] = requestedLine.ItemNumber,
+                ["productName"] = requestedLine.ProductName
+            };
+            var product = await ResolveProductAsync(lineEntities, ct);
+            if (product is null)
+            {
+                missing.Add(new AssistantMissingField(
+                  $"orderLines[{index}].product",
+                  "Every order line requires a valid catalog product.",
+                  $"Which catalog product should be used for order line {index + 1}?"));
+            }
+            if (requestedLine.Quantity <= 0)
+            {
+                missing.Add(new AssistantMissingField(
+                  $"orderLines[{index}].quantity",
+                  "Every order line requires a valid quantity.",
+                  $"What quantity should be used for order line {index + 1}?"));
+            }
+            if (product is not null && requestedLine.Quantity > 0)
+            {
+                resolvedLines.Add((product, requestedLine.Quantity));
+            }
         }
 
         DeliverToLocation? deliverTo = null;
@@ -884,7 +1060,9 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
         try
         {
             var requestedDate = DateTime.UtcNow.Date.AddDays(7);
-            var line = new OrderLineDto(product!.Id, quantity!.Value, product.Uom, product.Price, requestedDate, "ASC");
+            var lines = resolvedLines
+              .Select(line => new OrderLineDto(line.Product.Id, line.Quantity, line.Product.Uom, line.Product.Price, requestedDate, "ASC"))
+              .ToList();
             var customerPo = FirstNonEmpty(entities, "customerPo", "poNumber", "po");
             var freight = FirstNonEmpty(entities, "freightOption") ?? "Standard";
 
@@ -898,12 +1076,15 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
               false,
               freight,
               requestedDate,
-              [line],
+              lines,
               false,
               null
             );
 
-            var products = new Dictionary<string, Product> { [product.Id] = product };
+            var products = resolvedLines
+              .Select(line => line.Product)
+              .DistinctBy(product => product.Id)
+              .ToDictionary(product => product.Id);
             var validation = rules.Validate(request, account, products);
             var errors = validation.Where(v => string.Equals(v.Severity, "error", StringComparison.OrdinalIgnoreCase)).ToList();
             if (errors.Count > 0)
@@ -955,6 +1136,14 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
             db.AuditEvents.Add(new AuditEvent { OrderId = order.Id, EventType = "AssistantSubmissionSucceeded", Detail = submission.WebOrderNumber });
             await db.SaveChangesAsync(ct);
 
+            var submissionGrounding = new List<AssistantGrounding>
+            {
+                new("order", order.Id, $"Submitted with web order {submission.WebOrderNumber}"),
+                new("account", account.Id, account.Name)
+            };
+            submissionGrounding.AddRange(resolvedLines.Select(line =>
+              new AssistantGrounding("product", line.Product.Id, $"{line.Product.Name} ({line.Product.ItemNumber}) x {line.Quantity}")));
+
             return new OrderPlacementAttempt(
               true,
               true,
@@ -962,11 +1151,7 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
               $"Order submitted successfully. Web order number: {submission.WebOrderNumber}.",
               null,
               [],
-              [
-                new AssistantGrounding("order", order.Id, $"Submitted with web order {submission.WebOrderNumber}"),
-          new AssistantGrounding("product", product.Id, $"{product.Name} ({product.ItemNumber}) x {quantity.Value}"),
-          new AssistantGrounding("account", account.Id, account.Name)
-              ]
+              submissionGrounding
             );
         }
         catch (Exception ex)
@@ -1306,7 +1491,9 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
         public string? Intent { get; set; }
         public double? Confidence { get; set; }
         public string? Reply { get; set; }
+        public string? SearchQuery { get; set; }
         public Dictionary<string, string?>? Entities { get; set; }
+        public List<ModelOrderLine>? OrderLines { get; set; }
         public List<ModelMissingField>? MissingFields { get; set; }
         public List<string>? ClarificationQuestions { get; set; }
         public List<ModelToolCall>? ToolCalls { get; set; }
@@ -1338,6 +1525,14 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
         public string? ClarificationPrompt { get; set; }
     }
 
+    sealed class ModelOrderLine
+    {
+        public string? ProductId { get; set; }
+        public string? ItemNumber { get; set; }
+        public string? ProductName { get; set; }
+        public int Quantity { get; set; }
+    }
+
     sealed class ModelToolCall
     {
         public string Name { get; set; } = string.Empty;
@@ -1366,7 +1561,7 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
             type = "object",
             additionalProperties = false,
             required = new[] {
-        "status","intent","confidence","reply","entities","missingFields","clarificationQuestions","toolCalls","grounding","escalate","escalationReason","unsupportedReason","readyForSubmission","policy"
+        "status","intent","confidence","reply","searchQuery","entities","orderLines","missingFields","clarificationQuestions","toolCalls","grounding","escalate","escalationReason","unsupportedReason","readyForSubmission","policy"
       },
             properties = new
             {
@@ -1374,10 +1569,28 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
                 intent = new { type = "string", @enum = new[] { "Greeting", "CreateOrder", "FindProduct", "UpdateOrderLine", "UpdateShipping", "ReviewDraft", "SubmitOrder", "Unsupported", "Unknown" } },
                 confidence = new { type = "number", minimum = 0, maximum = 1 },
                 reply = new { type = "string" },
+                searchQuery = new { type = new[] { "string", "null" } },
                 entities = new
                 {
                     type = "object",
                     additionalProperties = new { type = new[] { "string", "null" } }
+                },
+                orderLines = new
+                {
+                    type = "array",
+                    items = new
+                    {
+                        type = "object",
+                        additionalProperties = false,
+                        required = new[] { "productId", "itemNumber", "productName", "quantity" },
+                        properties = new
+                        {
+                            productId = new { type = new[] { "string", "null" } },
+                            itemNumber = new { type = new[] { "string", "null" } },
+                            productName = new { type = new[] { "string", "null" } },
+                            quantity = new { type = "integer", minimum = 1 }
+                        }
+                    }
                 },
                 missingFields = new
                 {

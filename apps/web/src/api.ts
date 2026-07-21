@@ -111,12 +111,20 @@ export type AssistantChatMessage = {
   text: string;
 };
 
+export type AssistantOrderLine = {
+  productId?: string | null;
+  itemNumber?: string | null;
+  productName?: string | null;
+  quantity: number;
+};
+
 export type AssistantRequest = {
   message: string;
   conversationId?: string;
   orderId?: string;
   history?: AssistantChatMessage[];
   contextEntities?: Record<string, string | null>;
+  contextOrderLines?: AssistantOrderLine[];
 };
 
 export type AssistantMissingField = {
@@ -145,6 +153,7 @@ export type AssistantResponse = {
   confidence: number;
   reply: string;
   entities: Record<string, string | null>;
+  orderLines: AssistantOrderLine[];
   missingFields: AssistantMissingField[];
   clarificationQuestions: string[];
   toolCalls: AssistantToolCall[];
