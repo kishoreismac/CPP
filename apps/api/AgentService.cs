@@ -580,37 +580,69 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
       new { role = "user", content = JsonSerializer.Serialize(userPayload, JsonOptions) }
     };
 
-        var strictSchemaBody = new
+        object BuildRequestBody(object responseFormat, bool useModernTokenParameter)
         {
-            temperature,
-            max_tokens = maxTokens,
-            messages = baseMessages,
-            response_format = new
+            var body = new Dictionary<string, object?>
             {
-                type = "json_schema",
-                json_schema = new
-                {
-                    name = "cpp_agent_response",
-                    strict = true,
-                    schema = ModelOutputJsonSchema.Instance
-                }
+                ["messages"] = baseMessages,
+                ["response_format"] = responseFormat
+            };
+
+            if (useModernTokenParameter)
+            {
+                body["max_completion_tokens"] = maxTokens;
+            }
+            else
+            {
+                body["temperature"] = temperature;
+                body["max_tokens"] = maxTokens;
+            }
+
+            return body;
+        }
+
+        var strictResponseFormat = new
+        {
+            type = "json_schema",
+            json_schema = new
+            {
+                name = "cpp_agent_response",
+                strict = true,
+                schema = ModelOutputJsonSchema.Instance
             }
         };
 
-        var result = await SendModelRequestAsync(strictSchemaBody);
+        var useModernTokenParameter = false;
+        var result = await SendModelRequestAsync(BuildRequestBody(strictResponseFormat, useModernTokenParameter));
+        if (!result.Ok
+            && result.StatusCode == 400
+            && result.Raw.Contains("max_completion_tokens", StringComparison.OrdinalIgnoreCase))
+        {
+            useModernTokenParameter = true;
+            result = await SendModelRequestAsync(BuildRequestBody(strictResponseFormat, useModernTokenParameter));
+        }
+
         if (!result.Ok && result.StatusCode == 400 && result.Raw.Contains("Invalid schema for response_format", StringComparison.OrdinalIgnoreCase))
         {
-            var jsonObjectBody = new
-            {
-                temperature,
-                max_tokens = maxTokens,
-                messages = new object[] {
+            var jsonObjectMessages = new object[] {
           new { role = "system", content = systemPrompt },
           new { role = "system", content = instructionSet + " Return only a single valid JSON object with keys: status,intent,confidence,reply,searchQuery,entities,orderLines,missingFields,clarificationQuestions,toolCalls,grounding,escalate,escalationReason,unsupportedReason,readyForSubmission,policy." },
           new { role = "user", content = JsonSerializer.Serialize(userPayload, JsonOptions) }
-        },
-                response_format = new { type = "json_object" }
+        };
+            var jsonObjectBody = new Dictionary<string, object?>
+            {
+                ["messages"] = jsonObjectMessages,
+                ["response_format"] = new { type = "json_object" }
             };
+            if (useModernTokenParameter)
+            {
+                jsonObjectBody["max_completion_tokens"] = maxTokens;
+            }
+            else
+            {
+                jsonObjectBody["temperature"] = temperature;
+                jsonObjectBody["max_tokens"] = maxTokens;
+            }
             result = await SendModelRequestAsync(jsonObjectBody);
         }
 
