@@ -15,7 +15,7 @@ The templates deliberately do not recreate the App Service, Application Insights
 
 ## Required inputs
 
-Before deploying, replace `REPLACE_WITH_AVAILABLE_VERSION` and verify that the selected model, version, SKU, and quota exist in the target region. Capacity and model availability are subscription- and region-specific.
+Before deploying, verify that the selected model, version, SKU, and quota still exist in the target region. The checked-in development default was validated when the workflow was created, but model lifecycle and subscription quota are time-sensitive. The workflow performs this preflight check before every deployment.
 
 Obtain integration values after the Terraform deployment:
 

@@ -6,6 +6,7 @@ param namePrefix string = 'cpp'
 @allowed([
   'dev'
   'test'
+  'qa'
   'stage'
   'prod'
 ])

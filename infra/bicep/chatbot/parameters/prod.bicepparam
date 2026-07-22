@@ -4,9 +4,9 @@ param namePrefix = 'cpp'
 param environment = 'prod'
 param location = 'eastus2'
 
-// Confirm the exact model/version and quota in this region before deployment.
-param modelName = 'gpt-4.1-mini'
-param modelVersion = 'REPLACE_WITH_AVAILABLE_VERSION'
+// Reconfirm model lifecycle and quota immediately before deployment.
+param modelName = 'gpt-5.4-mini'
+param modelVersion = '2026-03-17'
 param modelDeploymentName = 'cpp-order-chat'
 param modelSkuName = 'GlobalStandard'
 param modelCapacity = 30
