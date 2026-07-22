@@ -580,37 +580,69 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
       new { role = "user", content = JsonSerializer.Serialize(userPayload, JsonOptions) }
     };
 
-        var strictSchemaBody = new
+        object BuildRequestBody(object responseFormat, bool useModernTokenParameter)
         {
-            temperature,
-            max_tokens = maxTokens,
-            messages = baseMessages,
-            response_format = new
+            var body = new Dictionary<string, object?>
             {
-                type = "json_schema",
-                json_schema = new
-                {
-                    name = "cpp_agent_response",
-                    strict = true,
-                    schema = ModelOutputJsonSchema.Instance
-                }
+                ["messages"] = baseMessages,
+                ["response_format"] = responseFormat
+            };
+
+            if (useModernTokenParameter)
+            {
+                body["max_completion_tokens"] = maxTokens;
+            }
+            else
+            {
+                body["temperature"] = temperature;
+                body["max_tokens"] = maxTokens;
+            }
+
+            return body;
+        }
+
+        var strictResponseFormat = new
+        {
+            type = "json_schema",
+            json_schema = new
+            {
+                name = "cpp_agent_response",
+                strict = true,
+                schema = ModelOutputJsonSchema.Instance
             }
         };
 
-        var result = await SendModelRequestAsync(strictSchemaBody);
+        var useModernTokenParameter = false;
+        var result = await SendModelRequestAsync(BuildRequestBody(strictResponseFormat, useModernTokenParameter));
+        if (!result.Ok
+            && result.StatusCode == 400
+            && result.Raw.Contains("max_completion_tokens", StringComparison.OrdinalIgnoreCase))
+        {
+            useModernTokenParameter = true;
+            result = await SendModelRequestAsync(BuildRequestBody(strictResponseFormat, useModernTokenParameter));
+        }
+
         if (!result.Ok && result.StatusCode == 400 && result.Raw.Contains("Invalid schema for response_format", StringComparison.OrdinalIgnoreCase))
         {
-            var jsonObjectBody = new
-            {
-                temperature,
-                max_tokens = maxTokens,
-                messages = new object[] {
+            var jsonObjectMessages = new object[] {
           new { role = "system", content = systemPrompt },
           new { role = "system", content = instructionSet + " Return only a single valid JSON object with keys: status,intent,confidence,reply,searchQuery,entities,orderLines,missingFields,clarificationQuestions,toolCalls,grounding,escalate,escalationReason,unsupportedReason,readyForSubmission,policy." },
           new { role = "user", content = JsonSerializer.Serialize(userPayload, JsonOptions) }
-        },
-                response_format = new { type = "json_object" }
+        };
+            var jsonObjectBody = new Dictionary<string, object?>
+            {
+                ["messages"] = jsonObjectMessages,
+                ["response_format"] = new { type = "json_object" }
             };
+            if (useModernTokenParameter)
+            {
+                jsonObjectBody["max_completion_tokens"] = maxTokens;
+            }
+            else
+            {
+                jsonObjectBody["temperature"] = temperature;
+                jsonObjectBody["max_tokens"] = maxTokens;
+            }
             result = await SendModelRequestAsync(jsonObjectBody);
         }
 
@@ -808,7 +840,7 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
 
     static string? ExtractAssistantContent(string raw)
     {
-        using var doc = JsonDocument.Parse(raw);
+        using var doc = ParseFirstJsonDocument(raw);
         if (!doc.RootElement.TryGetProperty("choices", out var choices) || choices.ValueKind != JsonValueKind.Array || choices.GetArrayLength() == 0)
         {
             return null;
@@ -840,7 +872,7 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
 
     static ModelOutput ParseModelOutput(string json)
     {
-        using var doc = JsonDocument.Parse(json);
+        using var doc = ParseFirstJsonDocument(json);
         var root = doc.RootElement;
 
         var output = new ModelOutput
@@ -864,6 +896,38 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
         };
 
         return output;
+    }
+
+    static JsonDocument ParseFirstJsonDocument(string json)
+    {
+        var normalized = json.Trim();
+        if (normalized.StartsWith("```", StringComparison.Ordinal))
+        {
+            var firstLineEnd = normalized.IndexOf('\n');
+            if (firstLineEnd >= 0)
+            {
+                normalized = normalized[(firstLineEnd + 1)..];
+            }
+            var closingFence = normalized.LastIndexOf("```", StringComparison.Ordinal);
+            if (closingFence >= 0)
+            {
+                normalized = normalized[..closingFence];
+            }
+            normalized = normalized.Trim();
+        }
+
+        var reader = new Utf8JsonReader(
+          Encoding.UTF8.GetBytes(normalized),
+          new JsonReaderOptions
+          {
+              AllowTrailingCommas = true,
+              CommentHandling = JsonCommentHandling.Skip
+          });
+        if (!reader.Read())
+        {
+            throw new JsonException("The AI provider returned an empty JSON payload.");
+        }
+        return JsonDocument.ParseValue(ref reader);
     }
 
     static List<ModelOrderLine> ParseOrderLines(JsonElement root)
