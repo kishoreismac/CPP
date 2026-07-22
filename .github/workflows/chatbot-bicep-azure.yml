@@ -141,8 +141,10 @@ jobs:
               exit 1
             fi
 
-            available="$(awk -v limit="$quota_limit" -v used="$quota_used" 'BEGIN { print limit - used }')"
-            if ! awk -v available="$available" -v requested="$MODEL_CAPACITY" 'BEGIN { exit !(available >= requested) }'; then
+            quota_limit_integer="${quota_limit%%.*}"
+            quota_used_integer="${quota_used%%.*}"
+            available=$((quota_limit_integer - quota_used_integer))
+            if (( available < MODEL_CAPACITY )); then
               echo "Insufficient ${quota_name} quota: requested ${MODEL_CAPACITY}, available ${available}." >&2
               exit 1
             fi
