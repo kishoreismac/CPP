@@ -85,167 +85,168 @@ jobs:
 
       - name: Resolve existing Terraform resources
         id: existing
-        shell: bash
-        run: |
-          set -euo pipefail
+        uses: azure/CLI@v2
+        with:
+          inlineScript: |
+            set -euo pipefail
 
-          resource_group="$(az group list \
-            --query "[?tags.application=='CPP Order Management Portal' && tags.environment=='${DEPLOY_ENVIRONMENT}'].name | [0]" \
-            --output tsv)"
-          if [[ -z "$resource_group" ]]; then
-            echo "No Terraform-managed CPP resource group was found for ${DEPLOY_ENVIRONMENT}." >&2
-            exit 1
-          fi
-
-          api_app="$(az webapp list --resource-group "$resource_group" \
-            --query "[?starts_with(name, 'api-')].name | [0]" --output tsv)"
-          api_principal_id="$(az webapp identity show --resource-group "$resource_group" \
-            --name "$api_app" --query principalId --output tsv)"
-          workspace_id="$(az monitor log-analytics workspace list --resource-group "$resource_group" \
-            --query '[0].id' --output tsv)"
-
-          for value in "$api_app" "$api_principal_id" "$workspace_id"; do
-            if [[ -z "$value" ]]; then
-              echo "An expected API identity or Log Analytics resource could not be resolved." >&2
+            resource_group="$(az group list \
+              --query "[?tags.application=='CPP Order Management Portal' && tags.environment=='${DEPLOY_ENVIRONMENT}'].name | [0]" \
+              --output tsv)"
+            if [[ -z "$resource_group" ]]; then
+              echo "No Terraform-managed CPP resource group was found for ${DEPLOY_ENVIRONMENT}." >&2
               exit 1
             fi
-          done
 
-          echo "resource_group=$resource_group" >> "$GITHUB_OUTPUT"
-          echo "api_app=$api_app" >> "$GITHUB_OUTPUT"
-          echo "api_principal_id=$api_principal_id" >> "$GITHUB_OUTPUT"
-          echo "workspace_id=$workspace_id" >> "$GITHUB_OUTPUT"
+            api_app="$(az webapp list --resource-group "$resource_group" \
+              --query "[?starts_with(name, 'api-')].name | [0]" --output tsv)"
+            api_principal_id="$(az webapp identity show --resource-group "$resource_group" \
+              --name "$api_app" --query principalId --output tsv)"
+            workspace_id="$(az monitor log-analytics workspace list --resource-group "$resource_group" \
+              --query '[0].id' --output tsv)"
+
+            for value in "$api_app" "$api_principal_id" "$workspace_id"; do
+              if [[ -z "$value" ]]; then
+                echo "An expected API identity or Log Analytics resource could not be resolved." >&2
+                exit 1
+              fi
+            done
+
+            echo "resource_group=$resource_group" >> "$GITHUB_OUTPUT"
+            echo "api_app=$api_app" >> "$GITHUB_OUTPUT"
+            echo "api_principal_id=$api_principal_id" >> "$GITHUB_OUTPUT"
+            echo "workspace_id=$workspace_id" >> "$GITHUB_OUTPUT"
 
       - name: Verify model availability and quota
-        shell: bash
-        run: |
-          set -euo pipefail
+        uses: azure/CLI@v2
+        with:
+          inlineScript: |
+            set -euo pipefail
 
-          version_count="$(az cognitiveservices model list --location "$AI_LOCATION" \
-            --query "length([?model.name=='${MODEL_NAME}' && model.version=='${MODEL_VERSION}' && contains(model.skus[].name, '${MODEL_SKU}')])" \
-            --output tsv)"
-          if [[ "$version_count" == "0" ]]; then
-            echo "${MODEL_NAME} ${MODEL_VERSION} with SKU ${MODEL_SKU} is unavailable in ${AI_LOCATION}." >&2
-            exit 1
-          fi
+            version_count="$(az cognitiveservices model list --location "$AI_LOCATION" \
+              --query "length([?model.name=='${MODEL_NAME}' && model.version=='${MODEL_VERSION}' && contains(model.skus[].name, '${MODEL_SKU}')])" \
+              --output tsv)"
+            if [[ "$version_count" == "0" ]]; then
+              echo "${MODEL_NAME} ${MODEL_VERSION} with SKU ${MODEL_SKU} is unavailable in ${AI_LOCATION}." >&2
+              exit 1
+            fi
 
-          quota_name="OpenAI.${MODEL_SKU}.${MODEL_NAME}"
-          quota_limit="$(az cognitiveservices usage list --location "$AI_LOCATION" \
-            --query "[?name.value=='${quota_name}'].limit | [0]" --output tsv)"
-          quota_used="$(az cognitiveservices usage list --location "$AI_LOCATION" \
-            --query "[?name.value=='${quota_name}'].currentValue | [0]" --output tsv)"
-          if [[ -z "$quota_limit" || -z "$quota_used" ]]; then
-            echo "No quota meter named ${quota_name} was found in ${AI_LOCATION}." >&2
-            exit 1
-          fi
+            quota_name="OpenAI.${MODEL_SKU}.${MODEL_NAME}"
+            quota_limit="$(az cognitiveservices usage list --location "$AI_LOCATION" \
+              --query "[?name.value=='${quota_name}'].limit | [0]" --output tsv)"
+            quota_used="$(az cognitiveservices usage list --location "$AI_LOCATION" \
+              --query "[?name.value=='${quota_name}'].currentValue | [0]" --output tsv)"
+            if [[ -z "$quota_limit" || -z "$quota_used" ]]; then
+              echo "No quota meter named ${quota_name} was found in ${AI_LOCATION}." >&2
+              exit 1
+            fi
 
-          available="$(awk -v limit="$quota_limit" -v used="$quota_used" 'BEGIN { print limit - used }')"
-          if ! awk -v available="$available" -v requested="$MODEL_CAPACITY" 'BEGIN { exit !(available >= requested) }'; then
-            echo "Insufficient ${quota_name} quota: requested ${MODEL_CAPACITY}, available ${available}." >&2
-            exit 1
-          fi
+            available="$(awk -v limit="$quota_limit" -v used="$quota_used" 'BEGIN { print limit - used }')"
+            if ! awk -v available="$available" -v requested="$MODEL_CAPACITY" 'BEGIN { exit !(available >= requested) }'; then
+              echo "Insufficient ${quota_name} quota: requested ${MODEL_CAPACITY}, available ${available}." >&2
+              exit 1
+            fi
 
-      - name: Compile Bicep templates
-        run: |
-          az bicep build --file "$BICEP_ROOT/main.bicep" --stdout >/dev/null
+      - name: Validate Bicep deployment
+        uses: azure/bicep-deploy@v2
+        with:
+          type: deployment
+          operation: validate
+          name: cpp-chatbot-${{ env.DEPLOY_ENVIRONMENT }}-${{ github.run_number }}-validate
+          scope: resourceGroup
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          resource-group-name: ${{ steps.existing.outputs.resource_group }}
+          template-file: ${{ env.BICEP_ROOT }}/main.bicep
+          validation-level: provider
+          parameters: |
+            environment: ${{ env.DEPLOY_ENVIRONMENT }}
+            location: ${{ env.AI_LOCATION }}
+            modelName: ${{ env.MODEL_NAME }}
+            modelVersion: ${{ env.MODEL_VERSION }}
+            modelSkuName: ${{ env.MODEL_SKU }}
+            modelCapacity: ${{ env.MODEL_CAPACITY }}
+            apiPrincipalId: ${{ steps.existing.outputs.api_principal_id }}
+            logAnalyticsWorkspaceResourceId: ${{ steps.existing.outputs.workspace_id }}
 
       - name: Preview resource changes
-        run: |
-          az deployment group what-if \
-            --name "cpp-chatbot-${DEPLOY_ENVIRONMENT}-${GITHUB_RUN_NUMBER}" \
-            --resource-group "${{ steps.existing.outputs.resource_group }}" \
-            --template-file "$BICEP_ROOT/main.bicep" \
-            --parameters \
-              environment="$DEPLOY_ENVIRONMENT" \
-              location="$AI_LOCATION" \
-              modelName="$MODEL_NAME" \
-              modelVersion="$MODEL_VERSION" \
-              modelSkuName="$MODEL_SKU" \
-              modelCapacity="$MODEL_CAPACITY" \
-              apiPrincipalId="${{ steps.existing.outputs.api_principal_id }}" \
-              logAnalyticsWorkspaceResourceId="${{ steps.existing.outputs.workspace_id }}" \
-            --no-pretty-print
+        uses: azure/bicep-deploy@v2
+        with:
+          type: deployment
+          operation: whatIf
+          name: cpp-chatbot-${{ env.DEPLOY_ENVIRONMENT }}-${{ github.run_number }}-whatif
+          scope: resourceGroup
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          resource-group-name: ${{ steps.existing.outputs.resource_group }}
+          template-file: ${{ env.BICEP_ROOT }}/main.bicep
+          validation-level: provider
+          what-if-exclude-change-types: Ignore NoChange Unsupported
+          parameters: |
+            environment: ${{ env.DEPLOY_ENVIRONMENT }}
+            location: ${{ env.AI_LOCATION }}
+            modelName: ${{ env.MODEL_NAME }}
+            modelVersion: ${{ env.MODEL_VERSION }}
+            modelSkuName: ${{ env.MODEL_SKU }}
+            modelCapacity: ${{ env.MODEL_CAPACITY }}
+            apiPrincipalId: ${{ steps.existing.outputs.api_principal_id }}
+            logAnalyticsWorkspaceResourceId: ${{ steps.existing.outputs.workspace_id }}
 
       - name: Deploy chatbot resources
         id: deployment
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          deployment_name="cpp-chatbot-${DEPLOY_ENVIRONMENT}-${GITHUB_RUN_NUMBER}"
-          az deployment group create \
-            --name "$deployment_name" \
-            --resource-group "${{ steps.existing.outputs.resource_group }}" \
-            --template-file "$BICEP_ROOT/main.bicep" \
-            --parameters \
-              environment="$DEPLOY_ENVIRONMENT" \
-              location="$AI_LOCATION" \
-              modelName="$MODEL_NAME" \
-              modelVersion="$MODEL_VERSION" \
-              modelSkuName="$MODEL_SKU" \
-              modelCapacity="$MODEL_CAPACITY" \
-              apiPrincipalId="${{ steps.existing.outputs.api_principal_id }}" \
-              logAnalyticsWorkspaceResourceId="${{ steps.existing.outputs.workspace_id }}" \
-            --output none
-
-          endpoint="$(az deployment group show \
-            --name "$deployment_name" \
-            --resource-group "${{ steps.existing.outputs.resource_group }}" \
-            --query properties.outputs.azureOpenAiEndpoint.value --output tsv)"
-          deployment="$(az deployment group show \
-            --name "$deployment_name" \
-            --resource-group "${{ steps.existing.outputs.resource_group }}" \
-            --query properties.outputs.agentDeploymentName.value --output tsv)"
-          api_version="$(az deployment group show \
-            --name "$deployment_name" \
-            --resource-group "${{ steps.existing.outputs.resource_group }}" \
-            --query properties.outputs.agentApiVersion.value --output tsv)"
-          key_reference="$(az deployment group show \
-            --name "$deployment_name" \
-            --resource-group "${{ steps.existing.outputs.resource_group }}" \
-            --query properties.outputs.agentApiKeyAppSettingValue.value --output tsv)"
-          account_name="$(az deployment group show \
-            --name "$deployment_name" \
-            --resource-group "${{ steps.existing.outputs.resource_group }}" \
-            --query properties.outputs.azureOpenAiAccountName.value --output tsv)"
-
-          echo "endpoint=$endpoint" >> "$GITHUB_OUTPUT"
-          echo "deployment=$deployment" >> "$GITHUB_OUTPUT"
-          echo "api_version=$api_version" >> "$GITHUB_OUTPUT"
-          echo "key_reference=$key_reference" >> "$GITHUB_OUTPUT"
-          echo "account_name=$account_name" >> "$GITHUB_OUTPUT"
+        uses: azure/bicep-deploy@v2
+        with:
+          type: deployment
+          operation: create
+          name: cpp-chatbot-${{ env.DEPLOY_ENVIRONMENT }}-${{ github.run_number }}
+          scope: resourceGroup
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          resource-group-name: ${{ steps.existing.outputs.resource_group }}
+          template-file: ${{ env.BICEP_ROOT }}/main.bicep
+          masked-outputs: agentApiKeyAppSettingValue
+          parameters: |
+            environment: ${{ env.DEPLOY_ENVIRONMENT }}
+            location: ${{ env.AI_LOCATION }}
+            modelName: ${{ env.MODEL_NAME }}
+            modelVersion: ${{ env.MODEL_VERSION }}
+            modelSkuName: ${{ env.MODEL_SKU }}
+            modelCapacity: ${{ env.MODEL_CAPACITY }}
+            apiPrincipalId: ${{ steps.existing.outputs.api_principal_id }}
+            logAnalyticsWorkspaceResourceId: ${{ steps.existing.outputs.workspace_id }}
 
       - name: Configure existing API chatbot settings
-        run: |
-          az webapp config appsettings set \
-            --resource-group "${{ steps.existing.outputs.resource_group }}" \
-            --name "${{ steps.existing.outputs.api_app }}" \
-            --settings \
-              "Agent__Endpoint=${{ steps.deployment.outputs.endpoint }}" \
-              "Agent__Deployment=${{ steps.deployment.outputs.deployment }}" \
-              "Agent__ApiVersion=${{ steps.deployment.outputs.api_version }}" \
-              'Agent__ApiKey=${{ steps.deployment.outputs.key_reference }}' \
-            --output none
+        uses: azure/CLI@v2
+        with:
+          inlineScript: |
+            az webapp config appsettings set \
+              --resource-group "${{ steps.existing.outputs.resource_group }}" \
+              --name "${{ steps.existing.outputs.api_app }}" \
+              --settings \
+                "Agent__Endpoint=${{ steps.deployment.outputs.azureOpenAiEndpoint }}" \
+                "Agent__Deployment=${{ steps.deployment.outputs.agentDeploymentName }}" \
+                "Agent__ApiVersion=${{ steps.deployment.outputs.agentApiVersion }}" \
+                'Agent__ApiKey=${{ steps.deployment.outputs.agentApiKeyAppSettingValue }}' \
+              --output none
 
       - name: Verify deployed resources
-        run: |
-          az cognitiveservices account show \
-            --resource-group "${{ steps.existing.outputs.resource_group }}" \
-            --name "${{ steps.deployment.outputs.account_name }}" \
-            --query "{name:name,state:properties.provisioningState,endpoint:properties.endpoint}" \
-            --output table
-          az cognitiveservices account deployment show \
-            --resource-group "${{ steps.existing.outputs.resource_group }}" \
-            --name "${{ steps.deployment.outputs.account_name }}" \
-            --deployment-name "${{ steps.deployment.outputs.deployment }}" \
-            --query "{name:name,state:properties.provisioningState,model:properties.model.name,version:properties.model.version}" \
-            --output table
+        uses: azure/CLI@v2
+        with:
+          inlineScript: |
+            az cognitiveservices account show \
+              --resource-group "${{ steps.existing.outputs.resource_group }}" \
+              --name "${{ steps.deployment.outputs.azureOpenAiAccountName }}" \
+              --query "{name:name,state:properties.provisioningState,endpoint:properties.endpoint}" \
+              --output table
+            az cognitiveservices account deployment show \
+              --resource-group "${{ steps.existing.outputs.resource_group }}" \
+              --name "${{ steps.deployment.outputs.azureOpenAiAccountName }}" \
+              --deployment-name "${{ steps.deployment.outputs.agentDeploymentName }}" \
+              --query "{name:name,state:properties.provisioningState,model:properties.model.name,version:properties.model.version}" \
+              --output table
 
       - name: Publish deployment summary
         run: |
           echo "### Chatbot Bicep deployment" >> "$GITHUB_STEP_SUMMARY"
           echo "- Environment: ${DEPLOY_ENVIRONMENT}" >> "$GITHUB_STEP_SUMMARY"
           echo "- Resource group: ${{ steps.existing.outputs.resource_group }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Azure OpenAI account: ${{ steps.deployment.outputs.account_name }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Azure OpenAI account: ${{ steps.deployment.outputs.azureOpenAiAccountName }}" >> "$GITHUB_STEP_SUMMARY"
           echo "- Model: ${MODEL_NAME} ${MODEL_VERSION} (${MODEL_SKU}, capacity ${MODEL_CAPACITY})" >> "$GITHUB_STEP_SUMMARY"
           echo "- API App Service: ${{ steps.existing.outputs.api_app }}" >> "$GITHUB_STEP_SUMMARY"
