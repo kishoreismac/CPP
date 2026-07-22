@@ -181,7 +181,6 @@ jobs:
           resource-group-name: ${{ steps.existing.outputs.resource_group }}
           template-file: ${{ env.BICEP_ROOT }}/main.bicep
           validation-level: provider
-          what-if-exclude-change-types: Ignore NoChange Unsupported
           parameters: |
             environment: ${{ env.DEPLOY_ENVIRONMENT }}
             location: ${{ env.AI_LOCATION }}
