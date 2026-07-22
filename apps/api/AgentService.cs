@@ -840,7 +840,7 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
 
     static string? ExtractAssistantContent(string raw)
     {
-        using var doc = JsonDocument.Parse(raw);
+        using var doc = ParseFirstJsonDocument(raw);
         if (!doc.RootElement.TryGetProperty("choices", out var choices) || choices.ValueKind != JsonValueKind.Array || choices.GetArrayLength() == 0)
         {
             return null;
@@ -872,7 +872,7 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
 
     static ModelOutput ParseModelOutput(string json)
     {
-        using var doc = JsonDocument.Parse(json);
+        using var doc = ParseFirstJsonDocument(json);
         var root = doc.RootElement;
 
         var output = new ModelOutput
@@ -896,6 +896,38 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
         };
 
         return output;
+    }
+
+    static JsonDocument ParseFirstJsonDocument(string json)
+    {
+        var normalized = json.Trim();
+        if (normalized.StartsWith("```", StringComparison.Ordinal))
+        {
+            var firstLineEnd = normalized.IndexOf('\n');
+            if (firstLineEnd >= 0)
+            {
+                normalized = normalized[(firstLineEnd + 1)..];
+            }
+            var closingFence = normalized.LastIndexOf("```", StringComparison.Ordinal);
+            if (closingFence >= 0)
+            {
+                normalized = normalized[..closingFence];
+            }
+            normalized = normalized.Trim();
+        }
+
+        var reader = new Utf8JsonReader(
+          Encoding.UTF8.GetBytes(normalized),
+          new JsonReaderOptions
+          {
+              AllowTrailingCommas = true,
+              CommentHandling = JsonCommentHandling.Skip
+          });
+        if (!reader.Read())
+        {
+            throw new JsonException("The AI provider returned an empty JSON payload.");
+        }
+        return JsonDocument.ParseValue(ref reader);
     }
 
     static List<ModelOrderLine> ParseOrderLines(JsonElement root)
