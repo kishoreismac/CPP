@@ -221,10 +221,10 @@ jobs:
               --resource-group "${{ steps.existing.outputs.resource_group }}" \
               --name "${{ steps.existing.outputs.api_app }}" \
               --settings \
-                "Agent__Endpoint=${{ steps.deployment.outputs.azureOpenAiEndpoint }}" \
-                "Agent__Deployment=${{ steps.deployment.outputs.agentDeploymentName }}" \
-                "Agent__ApiVersion=${{ steps.deployment.outputs.agentApiVersion }}" \
-                'Agent__ApiKey=${{ steps.deployment.outputs.agentApiKeyAppSettingValue }}' \
+                "AGENT_ENDPOINT=${{ steps.deployment.outputs.azureOpenAiEndpoint }}" \
+                "AGENT_DEPLOYMENT=${{ steps.deployment.outputs.agentDeploymentName }}" \
+                "AGENT_APIVERSION=${{ steps.deployment.outputs.agentApiVersion }}" \
+                'AGENT_API_KEY=${{ steps.deployment.outputs.agentApiKeyAppSettingValue }}' \
               --output none
 
       - name: Verify deployed resources
