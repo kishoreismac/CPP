@@ -83,7 +83,9 @@ public record AssistantResponse(
   AssistantPolicyResult Policy,
   AssistantVersionInfo Version,
   AssistantTrace Trace,
-  IReadOnlyList<AssistantOrderLine>? OrderLines = null
+  IReadOnlyList<AssistantOrderLine>? OrderLines = null,
+  string? SearchQuery = null,
+  string? SearchSummary = null
 );
 
 public record AssistantHealthResponse(

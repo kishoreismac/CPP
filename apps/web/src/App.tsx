@@ -24,6 +24,7 @@ import {
   Star,
   MessageCircle,
   ChevronDown,
+  ChevronRight,
   HelpCircle,
   Package,
   CheckCircle2,
@@ -65,15 +66,15 @@ const future = () => {
 };
 const assistantStarters = [
   {
-    label: "Find glyphosate products",
-    detail: "Show matching products and availability",
-    prompt: "Find all glyphosate products currently available in the catalog.",
+    label: "Find by active ingredient",
+    detail: "Choose from all active ingredients",
+    mode: "activeIngredient" as const,
     kind: "search",
   },
   {
-    label: "Find products starting with THU",
-    detail: "Search the full catalog by product name",
-    prompt: "Show all products whose names start with THU.",
+    label: "Find by product name",
+    detail: "Choose from the complete product catalog",
+    mode: "productName" as const,
     kind: "search",
   },
   {
@@ -91,6 +92,8 @@ const assistantStarters = [
     kind: "order",
   },
 ];
+const assistantWelcomeMessage =
+  "I can find products, prepare CPP orders, and keep the order ready for your review before submission.";
 function App() {
   return (
     <QueryClientProvider client={qc}>
@@ -2197,8 +2200,13 @@ function Confirmation() {
 }
 function Assistant() {
   const location = useLocation();
+  const nav = useNavigate();
   const query = useQueryClient();
+  const chatLogRef = useRef<HTMLDivElement>(null);
   const [open, setOpen] = useState(false);
+  const [catalogChoiceMode, setCatalogChoiceMode] = useState<
+    "activeIngredient" | "productName" | null
+  >(null);
   const [conversationId, setConversationId] = useState<string | undefined>();
   const [contextEntities, setContextEntities] = useState<
     Record<string, string | null>
@@ -2216,6 +2224,8 @@ function Assistant() {
       clarificationQuestions?: string[];
       toolCalls?: AssistantToolCall[];
       intent?: string;
+      searchQuery?: string;
+      searchSummary?: string;
       entities?: Record<string, string | null>;
       orderLines?: AssistantOrderLine[];
       grounding?: AssistantResponse["grounding"];
@@ -2224,7 +2234,7 @@ function Assistant() {
   >([
     {
       role: "assistant",
-      text: "I can find products, prepare CPP orders, and keep the order ready for your review before submission.",
+      text: assistantWelcomeMessage,
     },
   ]);
   const [text, setText] = useState("");
@@ -2232,6 +2242,32 @@ function Assistant() {
     /\/crop-protection\/orders\/([^/]+)/,
   );
   const orderId = orderIdMatch?.[1];
+  const catalog = useQuery({
+    queryKey: ["assistant-product-catalog"],
+    queryFn: () => api<Product[]>("/products/search?q="),
+    enabled: open && catalogChoiceMode !== null,
+    staleTime: 60_000,
+  });
+  const activeIngredientChoices = Array.from(
+    new Set(
+      (catalog.data ?? [])
+        .flatMap((product) => product.activeIngredients.split(/[,;]/))
+        .map((ingredient) => ingredient.trim())
+        .filter(Boolean),
+    ),
+  ).sort((left, right) => left.localeCompare(right));
+  const productChoices = [...(catalog.data ?? [])].sort((left, right) =>
+    left.name.localeCompare(right.name),
+  );
+
+  useEffect(() => {
+    if (!open) return;
+    const frame = requestAnimationFrame(() => {
+      const chatLog = chatLogRef.current;
+      chatLog?.scrollTo({ top: chatLog.scrollHeight, behavior: "smooth" });
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [messages, open, catalogChoiceMode, catalog.data]);
 
   const send = useMutation({
     mutationFn: (message: string) => {
@@ -2269,6 +2305,8 @@ function Assistant() {
           clarificationQuestions: r.clarificationQuestions,
           toolCalls: r.toolCalls,
           intent: r.intent,
+          searchQuery: r.searchQuery,
+          searchSummary: r.searchSummary,
           entities: r.entities,
           orderLines: r.orderLines,
           grounding: r.grounding,
@@ -2278,12 +2316,120 @@ function Assistant() {
     },
   });
 
+  const editDraft = useMutation({
+    mutationFn: async ({
+      entities,
+      orderLines,
+    }: {
+      entities: Record<string, string | null>;
+      orderLines: AssistantOrderLine[];
+    }) => {
+      const [accounts, products] = await Promise.all([
+        api<Account[]>("/accounts"),
+        api<Product[]>("/products/search?q="),
+      ]);
+      const normalize = (value?: string | null) =>
+        (value ?? "").replace(/[^a-z0-9]/gi, "").toLowerCase();
+      const accountReference = firstEntity(
+        entities,
+        "shipToAccountId",
+        "accountId",
+        "shipToAccountName",
+        "accountName",
+        "account",
+      );
+      const account = accounts.find(
+        (candidate) =>
+          candidate.id === accountReference ||
+          normalize(candidate.name) === normalize(accountReference) ||
+          normalize(candidate.accountNumber) === normalize(accountReference),
+      );
+      if (!account)
+        throw new Error("The Ship-To account could not be resolved.");
+
+      const deliveryLocations = await api<DeliverTo[]>(
+        `/accounts/${account.id}/deliver-to-locations`,
+      );
+      const deliveryReference = firstEntity(
+        entities,
+        "deliverToAccountId",
+        "deliverToId",
+        "deliverToName",
+        "deliveryLocation",
+        "deliverTo",
+      );
+      const delivery =
+        deliveryLocations.find(
+          (candidate) =>
+            candidate.id === deliveryReference ||
+            normalize(candidate.name) === normalize(deliveryReference),
+        ) ?? deliveryLocations.find((candidate) => candidate.isDefault);
+
+      const lines = orderLines.map((line) => {
+        const product = products.find(
+          (candidate) =>
+            candidate.id === line.productId ||
+            normalize(candidate.itemNumber) === normalize(line.itemNumber) ||
+            normalize(candidate.name) === normalize(line.productName),
+        );
+        if (!product)
+          throw new Error(
+            `The product ${line.productName ?? line.itemNumber ?? "in the order"} could not be resolved.`,
+          );
+        return {
+          productId: product.id,
+          quantity: line.quantity,
+          uom: product.uom,
+          unitPrice: product.price,
+          requestedArrivalDate:
+            firstEntity(entities, "requestedArrivalDate", "deliveryDate") ??
+            future(),
+          inventorySource: "ASC",
+        } satisfies Line;
+      });
+      if (!lines.length) throw new Error("The order has no products to edit.");
+
+      return api<Order>("/orders", {
+        method: "POST",
+        body: JSON.stringify({
+          ...blank,
+          shipToAccountId: account.id,
+          deliverToAccountId: delivery?.id,
+          customerPo:
+            firstEntity(entities, "customerPo", "poNumber", "po") ?? "",
+          contactEmail: account.contactEmail,
+          shippingInstructions: account.shippingInstructions,
+          requestedArrivalDate:
+            firstEntity(entities, "requestedArrivalDate", "deliveryDate") ??
+            future(),
+          lines,
+        }),
+      });
+    },
+    onSuccess: (order) => {
+      query.invalidateQueries({ queryKey: ["orders"] });
+      setOpen(false);
+      nav(`/crop-protection/orders/${order.id}/edit`);
+    },
+  });
+
   function go(v = text) {
     if (!v.trim()) return;
     setMessages((m) => [...m, { role: "user", text: v }]);
     send.mutate(v);
     setText("");
   }
+
+  function clearChat() {
+    setConversationId(undefined);
+    setContextEntities({});
+    setContextOrderLines([]);
+    setMessages([{ role: "assistant", text: assistantWelcomeMessage }]);
+    setCatalogChoiceMode(null);
+    setText("");
+    send.reset();
+  }
+
   return (
     <div className="chat">
       <button
@@ -2297,16 +2443,35 @@ function Assistant() {
         <section className="chat-panel">
           <div className="modal-head">
             <b>CPP Order Assistant</b>
-            <button onClick={() => setOpen(false)}>
-              <X size={17} />
-            </button>
+            <div className="chat-head-actions">
+              <button
+                className="chat-clear"
+                disabled={send.isPending || messages.length === 1}
+                onClick={clearChat}
+                title="Start a new conversation"
+              >
+                <RotateCcw size={14} /> Clear chat
+              </button>
+              <button
+                aria-label="Close CPP assistant"
+                onClick={() => setOpen(false)}
+              >
+                <X size={17} />
+              </button>
+            </div>
           </div>
-          <div className="chat-log">
+          <div className="chat-log" ref={chatLogRef}>
             {messages.map((m, i) => (
               <div className={m.role} key={i}>
-                {m.intent === "FindProduct" && m.products?.length
-                  ? `Found ${m.products.length} matching product${m.products.length === 1 ? "" : "s"}. Select a product or tell me which item and quantity you want.`
-                  : m.text}
+                {m.intent === "FindProduct" ? (
+                  m.searchSummary ? (
+                    <p className="assistant-search-summary">
+                      {m.searchSummary}
+                    </p>
+                  ) : null
+                ) : (
+                  m.text
+                )}
                 {m.intent !== "FindProduct" &&
                   !!m.clarificationQuestions?.length && (
                     <div className="assistant-block">
@@ -2318,19 +2483,34 @@ function Assistant() {
                   )}
                 {m.intent === "FindProduct" &&
                   m.products?.map((p) => (
-                    <div className="sku" key={p.id}>
+                    <button
+                      type="button"
+                      className="sku"
+                      key={p.id}
+                      disabled={send.isPending}
+                      aria-label={`Select ${p.name}, item ${p.itemNumber}`}
+                      onClick={() =>
+                        go(`I want to order ${p.name} (Item #${p.itemNumber}).`)
+                      }
+                    >
                       <div className="sku-head">
                         <b>{p.name}</b>
-                        <span
-                          className={`sku-status ${p.stoplightStatus.toLowerCase()}`}
-                        >
-                          {p.stoplightStatus}
+                        <span className="sku-head-actions">
+                          <span
+                            className={`sku-status ${p.stoplightStatus.toLowerCase()}`}
+                          >
+                            {p.stoplightStatus}
+                          </span>
+                          <ChevronRight size={16} aria-hidden="true" />
                         </span>
                       </div>
                       <small>
                         {p.itemNumber} · {p.packageSize}
                       </small>
-                    </div>
+                      <small className="sku-ingredient">
+                        Active ingredient: {p.activeIngredients}
+                      </small>
+                    </button>
                   ))}
                 {m.entities &&
                   m.status !== "Complete" &&
@@ -2342,16 +2522,62 @@ function Assistant() {
                       hasOutstandingQuestions={Boolean(
                         m.clarificationQuestions?.length,
                       )}
-                      busy={send.isPending}
+                      busy={send.isPending || editDraft.isPending}
                       onConfirm={() =>
                         go(
                           "Confirm and submit this order using the reviewed details.",
                         )
                       }
-                      onEdit={() => setText("Change the order so that ")}
+                      onEdit={() =>
+                        editDraft.mutate({
+                          entities: m.entities ?? {},
+                          orderLines: m.orderLines ?? [],
+                        })
+                      }
                       onAddProduct={() =>
                         go("I want to add another product to this order.")
                       }
+                      onQuantityChange={(lineIndex, quantity) => {
+                        const currentLines = m.orderLines?.length
+                          ? m.orderLines
+                          : [
+                              {
+                                productId: m.entities?.productId,
+                                itemNumber: m.entities?.itemNumber,
+                                productName: m.entities?.productName,
+                                quantity: Number(m.entities?.quantity),
+                              },
+                            ];
+                        const nextLines = currentLines
+                          .map((line, index) =>
+                            index === lineIndex ? { ...line, quantity } : line,
+                          )
+                          .filter((line) => line.quantity > 0);
+                        const singleLine =
+                          nextLines.length === 1 ? nextLines[0] : undefined;
+                        const nextEntities = {
+                          ...(m.entities ?? {}),
+                          quantity: singleLine
+                            ? String(singleLine.quantity)
+                            : null,
+                          productId: singleLine?.productId ?? null,
+                          itemNumber: singleLine?.itemNumber ?? null,
+                          productName: singleLine?.productName ?? null,
+                        };
+                        setMessages((current) =>
+                          current.map((message, messageIndex) =>
+                            messageIndex === i
+                              ? {
+                                  ...message,
+                                  entities: nextEntities,
+                                  orderLines: nextLines,
+                                }
+                              : message,
+                          ),
+                        );
+                        setContextEntities(nextEntities);
+                        setContextOrderLines(nextLines);
+                      }}
                     />
                   )}
                 {m.status === "Complete" && m.intent === "SubmitOrder" && (
@@ -2367,7 +2593,7 @@ function Assistant() {
                 )}
               </div>
             ))}
-            {messages.length === 1 && (
+            {messages.length === 1 && !catalogChoiceMode && (
               <section
                 className="assistant-starters"
                 aria-label="Starter questions"
@@ -2381,7 +2607,11 @@ function Assistant() {
                     <button
                       key={starter.label}
                       disabled={send.isPending}
-                      onClick={() => go(starter.prompt)}
+                      onClick={() =>
+                        "mode" in starter
+                          ? setCatalogChoiceMode(starter.mode ?? null)
+                          : go(starter.prompt)
+                      }
                     >
                       <span
                         className={`assistant-starter-icon ${starter.kind}`}
@@ -2401,7 +2631,85 @@ function Assistant() {
                 </div>
               </section>
             )}
+            {messages.length === 1 && catalogChoiceMode && (
+              <section
+                className="assistant-catalog-picker"
+                aria-label={
+                  catalogChoiceMode === "activeIngredient"
+                    ? "Choose an active ingredient"
+                    : "Choose a product"
+                }
+              >
+                <div className="assistant-picker-head">
+                  <div>
+                    <b>
+                      {catalogChoiceMode === "activeIngredient"
+                        ? "Choose an active ingredient"
+                        : "Choose a product"}
+                    </b>
+                    <small>
+                      {catalogChoiceMode === "activeIngredient"
+                        ? "Select an ingredient to see matching products"
+                        : "Select a product to start an order"}
+                    </small>
+                  </div>
+                  <button onClick={() => setCatalogChoiceMode(null)}>
+                    Back
+                  </button>
+                </div>
+                {catalog.isPending && <small>Loading catalog…</small>}
+                {catalog.isError && (
+                  <small>Unable to load the catalog. Please try again.</small>
+                )}
+                {!catalog.isPending && !catalog.isError && (
+                  <div className="assistant-picker-list">
+                    {catalogChoiceMode === "activeIngredient"
+                      ? activeIngredientChoices.map((ingredient) => (
+                          <button
+                            key={ingredient}
+                            onClick={() => {
+                              setCatalogChoiceMode(null);
+                              go(
+                                `Find products with the active ingredient ${ingredient}.`,
+                              );
+                            }}
+                          >
+                            <span>
+                              <b>{ingredient}</b>
+                              <small>View matching products</small>
+                            </span>
+                            <ChevronRight size={16} />
+                          </button>
+                        ))
+                      : productChoices.map((product) => (
+                          <button
+                            key={product.id}
+                            onClick={() => {
+                              setCatalogChoiceMode(null);
+                              go(
+                                `I want to order ${product.name} (Item #${product.itemNumber}).`,
+                              );
+                            }}
+                          >
+                            <span>
+                              <b>{product.name}</b>
+                              <small>
+                                {product.itemNumber} · {product.packageSize}
+                              </small>
+                            </span>
+                            <ChevronRight size={16} />
+                          </button>
+                        ))}
+                  </div>
+                )}
+              </section>
+            )}
           </div>
+          {editDraft.isError && (
+            <p className="error assistant-edit-error" role="alert">
+              {editDraft.error.message}
+            </p>
+          )}
           <div className="inline">
             <input
               aria-label="Assistant message"
@@ -2454,6 +2762,7 @@ function AssistantOrderReview({
   onConfirm,
   onEdit,
   onAddProduct,
+  onQuantityChange,
 }: {
   entities: Record<string, string | null>;
   orderLines: AssistantOrderLine[];
@@ -2463,6 +2772,7 @@ function AssistantOrderReview({
   onConfirm: () => void;
   onEdit: () => void;
   onAddProduct: () => void;
+  onQuantityChange: (lineIndex: number, quantity: number) => void;
 }) {
   const product = firstEntity(
     entities,
@@ -2533,9 +2843,35 @@ function AssistantOrderReview({
                   <em>#{line.itemNumber}</em>
                 )}
               </div>
-              <div>
+              <div className="assistant-quantity-control">
                 <small>Quantity</small>
-                <b>{line.quantity}</b>
+                <span>
+                  <button
+                    type="button"
+                    disabled={busy}
+                    aria-label={
+                      line.quantity === 1
+                        ? `Remove ${lineName}`
+                        : `Decrease quantity of ${lineName}`
+                    }
+                    title={line.quantity === 1 ? "Remove product" : "Decrease"}
+                    onClick={() => onQuantityChange(index, line.quantity - 1)}
+                  >
+                    <Minus size={13} />
+                  </button>
+                  <b aria-label={`Quantity ${line.quantity}`}>
+                    {line.quantity}
+                  </b>
+                  <button
+                    type="button"
+                    disabled={busy}
+                    aria-label={`Increase quantity of ${lineName}`}
+                    title="Increase"
+                    onClick={() => onQuantityChange(index, line.quantity + 1)}
+                  >
+                    <Plus size={13} />
+                  </button>
+                </span>
               </div>
             </div>
           );
@@ -2601,9 +2937,14 @@ function AssistantOrderConfirmation({
       </div>
       <div className="assistant-confirm-actions">
         {orderId && (
-          <Link to={`/crop-protection/orders/${orderId}`}>
-            <FileText size={15} /> View order
-          </Link>
+          <>
+            <Link to={`/crop-protection/orders/${orderId}`}>
+              <FileText size={15} /> View order
+            </Link>
+            <a href={`${API}/orders/${orderId}/confirmation.pdf`} download>
+              <Download size={15} /> Export PDF
+            </a>
+          </>
         )}
         <Link to="/crop-protection/orders">
           <Truck size={15} /> Track orders

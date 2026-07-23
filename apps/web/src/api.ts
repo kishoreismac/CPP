@@ -152,6 +152,8 @@ export type AssistantResponse = {
   intent: string;
   confidence: number;
   reply: string;
+  searchQuery?: string;
+  searchSummary?: string;
   entities: Record<string, string | null>;
   orderLines: AssistantOrderLine[];
   missingFields: AssistantMissingField[];

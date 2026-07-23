@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Data;
 using System.Security.Cryptography;
 using System.Text;
 using Microsoft.EntityFrameworkCore;
@@ -8,6 +9,41 @@ namespace Cpp.Api;
 public class AppDb(DbContextOptions<AppDb> options) : DbContext(options) { public DbSet<Account> Accounts => Set<Account>(); public DbSet<DeliverToLocation> DeliverToLocations => Set<DeliverToLocation>(); public DbSet<Product> Products => Set<Product>(); public DbSet<Order> Orders => Set<Order>(); public DbSet<AuditEvent> AuditEvents => Set<AuditEvent>(); }
 public static class SeedData
 {
+    static string SearchToken(params string[] values) => string.Concat(values.SelectMany(value => value.Where(char.IsLetterOrDigit))).ToUpperInvariant();
+
+    static void EnsureProductSearchColumn(AppDb db)
+    {
+        var connection = db.Database.GetDbConnection();
+        var shouldClose = connection.State != ConnectionState.Open;
+        if (shouldClose) connection.Open();
+        try
+        {
+            using var inspect = connection.CreateCommand();
+            inspect.CommandText = "PRAGMA table_info(\"Products\")";
+            using var reader = inspect.ExecuteReader();
+            var exists = false;
+            while (reader.Read())
+            {
+                if (string.Equals(reader.GetString(1), nameof(Product.SearchTextNormalized), StringComparison.OrdinalIgnoreCase))
+                {
+                    exists = true;
+                    break;
+                }
+            }
+            reader.Close();
+            if (!exists)
+            {
+                using var alter = connection.CreateCommand();
+                alter.CommandText = "ALTER TABLE \"Products\" ADD COLUMN \"SearchTextNormalized\" TEXT NOT NULL DEFAULT ''";
+                alter.ExecuteNonQuery();
+            }
+        }
+        finally
+        {
+            if (shouldClose) connection.Close();
+        }
+    }
+
     static string BuildItemNumber(string shortName, int sequence, ISet<int> usedNumericParts)
     {
         var prefix = new string(shortName
@@ -29,6 +65,7 @@ public static class SeedData
     public static void Seed(AppDb db)
     {
         db.Database.EnsureCreated();
+        EnsureProductSearchColumn(db);
         var seededAccounts = new[]
         {
          new Account { Id = "adrian", AccountNumber = "9953592", Name = "MFA-ADRIAN", Address = "438 NW County Road 11002, Adrian, MO 64720", City = "Adrian", PostalCode = "64720", SoldToName = "WFU-MEMBER-1001", ContactEmail = "orders.adrian@example.com", ShippingInstructions = "Deliver during business hours. Contact location before unloading." },
@@ -53,20 +90,22 @@ public static class SeedData
         {
             var productId = $"p{i + 1:00}";
             var itemNumber = BuildItemNumber(names[i], i + 1, usedNumericParts);
+            var n = names[i];
+            var glyph = i < 12;
+            var activeIngredients = glyph ? "Glyphosate" : i == 12 ? "Glufosinate" : i == 13 ? "Atrazine" : i == 14 ? "Dicamba" : i == 15 ? "2,4-D" : "Demonstration active ingredient";
             var existingProduct = db.Products.Find(productId);
             if (existingProduct is not null)
             {
                 // Keep existing databases aligned with the searchable mnemonic SKU scheme.
                 existingProduct.ItemNumber = itemNumber;
+                existingProduct.SearchTextNormalized = SearchToken(itemNumber, n, activeIngredients);
                 continue;
             }
 
-            var n = names[i];
-            var glyph = i < 12;
             var inventory = i < inventories.Length ? inventories[i] : 60 + i;
             var limited = inventory > 0 && inventory <= 13;
             var unavailable = inventory == 0;
-            db.Products.Add(new Product { Id = productId, ItemNumber = itemNumber, Name = n, ShortName = n, Supplier = i < 4 || i is 8 or 9 or 14 || i is >= 20 and <= 22 ? "WinField United" : i is 4 or 5 ? "Syngenta" : i is 6 or 7 ? "Albaugh Chemical Corporation" : i is 10 or 11 ? "Bayer" : i == 12 ? "BASF" : i is 13 or 15 ? "Generic Crop Solutions" : i is 16 or 17 ? "Crop Health Sciences" : i is 18 or 19 ? "FieldGuard" : i is 23 or 24 ? "Biological Crop Systems" : "Demo Ag Sciences", Category = i < 16 ? "Herbicide" : i < 18 ? "Fungicide" : i < 20 ? "Insecticide" : i < 23 ? "Adjuvant" : "Biological/Inoculant", ProductLine = n.Split(' ')[0], ActiveIngredients = glyph ? "Glyphosate" : i == 12 ? "Glufosinate" : i == 13 ? "Atrazine" : i == 14 ? "Dicamba" : i == 15 ? "2,4-D" : "Demonstration active ingredient", Gtin = $"00012345{i:00000}", PackageSize = i is 1 or 2 ? "135 GA IBC(s)" : i is 3 or 6 ? "275 GA IBC(s)" : i is 5 or 9 or 11 ? "Bulk Gallon(s)" : "2 x 2.5 GA Case(s)", Uom = i is 1 or 2 or 3 or 6 ? "IBC" : i is 5 or 9 or 11 ? "GA" : i == 22 ? "BAG" : i is 23 or 24 ? "UNIT" : "CASE", Price = i < prices.Length ? prices[i] : 42.50m + i, PriceUom = i >= 22 ? i == 22 ? "BAG" : "UNIT" : "GA", Favorite = i < 4, AvailableInventory = inventory, StoplightStatus = unavailable ? "No Availability" : limited ? "Limited Availability" : "Available", Orderable = !unavailable });
+            db.Products.Add(new Product { Id = productId, ItemNumber = itemNumber, Name = n, ShortName = n, Supplier = i < 4 || i is 8 or 9 or 14 || i is >= 20 and <= 22 ? "WinField United" : i is 4 or 5 ? "Syngenta" : i is 6 or 7 ? "Albaugh Chemical Corporation" : i is 10 or 11 ? "Bayer" : i == 12 ? "BASF" : i is 13 or 15 ? "Generic Crop Solutions" : i is 16 or 17 ? "Crop Health Sciences" : i is 18 or 19 ? "FieldGuard" : i is 23 or 24 ? "Biological Crop Systems" : "Demo Ag Sciences", Category = i < 16 ? "Herbicide" : i < 18 ? "Fungicide" : i < 20 ? "Insecticide" : i < 23 ? "Adjuvant" : "Biological/Inoculant", ProductLine = n.Split(' ')[0], ActiveIngredients = activeIngredients, SearchTextNormalized = SearchToken(itemNumber, n, activeIngredients), Gtin = $"00012345{i:00000}", PackageSize = i is 1 or 2 ? "135 GA IBC(s)" : i is 3 or 6 ? "275 GA IBC(s)" : i is 5 or 9 or 11 ? "Bulk Gallon(s)" : "2 x 2.5 GA Case(s)", Uom = i is 1 or 2 or 3 or 6 ? "IBC" : i is 5 or 9 or 11 ? "GA" : i == 22 ? "BAG" : i is 23 or 24 ? "UNIT" : "CASE", Price = i < prices.Length ? prices[i] : 42.50m + i, PriceUom = i >= 22 ? i == 22 ? "BAG" : "UNIT" : "GA", Favorite = i < 4, AvailableInventory = inventory, StoplightStatus = unavailable ? "No Availability" : limited ? "Limited Availability" : "Available", Orderable = !unavailable });
         }
         var today = DateTime.UtcNow.Date;
         var seededOrders = new[]

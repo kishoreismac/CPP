@@ -113,8 +113,7 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
         var modelToolCalls = modelOutput.ToolCalls ?? [];
         if (!modelToolCalls.Any(t => string.Equals(t.Name, "search_products", StringComparison.OrdinalIgnoreCase))
             && ParseIntent(modelOutput.Intent) == AssistantIntent.FindProduct
-            && modelOutput.Policy?.PromptInjectionDetected != true
-            && !string.IsNullOrWhiteSpace(modelOutput.SearchQuery))
+            && modelOutput.Policy?.PromptInjectionDetected != true)
         {
             modelToolCalls.Add(new ModelToolCall
             {
@@ -122,7 +121,7 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
                 Reason = "Application-orchestrated catalog lookup from the model's structured FindProduct decision.",
                 Arguments = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
                 {
-                    ["query"] = modelOutput.SearchQuery.Trim()
+                    ["query"] = modelOutput.SearchQuery?.Trim() ?? string.Empty
                 }
             });
         }
@@ -153,9 +152,9 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
         {
             var executedToolResults = new
             {
-                instructions = "Generate the final user-facing response from these executed database results. Do not repeat lookup tool calls. Never claim that a product is absent unless the catalog-search result reports zero matches.",
+                instructions = "Generate the final grounded response from these database results. Set searchSummary to one short sentence that identifies what matched and the count, for example a product-name prefix, canonical active ingredient, or item-number fragment. The summary must not contain any individual product name, item number, package, availability, or numbered list because the application renders product cards separately. End searchSummary with a colon when matches exist. Keep reply concise as well. Do not repeat lookup tool calls. Never claim that a product is absent unless the catalog-search result reports zero matches.",
                 calls = lookupToolCalls,
-                products = toolResults.Products.Select(p => new
+                products = toolResults.Products.Take(50).Select(p => new
                 {
                     p.Id,
                     p.ItemNumber,
@@ -173,6 +172,7 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
             try
             {
                 var followupOutput = await GetModelDecisionAsync(effectiveRequest, contextSnapshot, apiConfig, ct, executedToolResults);
+                followupOutput.SearchQuery ??= modelOutput.SearchQuery;
                 var followupToolCalls = followupOutput.ToolCalls ?? [];
                 modelToolCalls.AddRange(followupToolCalls);
                 acceptedToolCalls.AddRange(followupToolCalls
@@ -380,7 +380,9 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
           request.History?.Count ?? 0,
           inputHash,
           status.ToString().ToLowerInvariant(),
-          orderLines
+          orderLines,
+          modelOutput.SearchQuery,
+          modelOutput.SearchSummary
         );
     }
 
@@ -544,7 +546,8 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
           "You are a CPP ordering assistant. Interpret user intent from the entire conversation, including natural-language confirmations, corrections, and rejections. Always return valid JSON that matches the schema. Keep transaction control in application code. Never claim submission unless you emit place_order in the same response.";
         var instructionSet = config["Agent:InstructionSet"] ??
           "The catalog can be arbitrarily large. Always call search_products for product, SKU, availability, or active-ingredient questions. Never infer absence from contextSnapshot or claim not-found without an executed catalog search returning zero matches. When executedToolResults is present, answer only from those results and do not repeat lookup calls. Maintain structured order state across the conversation. Merge contextEntities with new facts and corrections, return the complete state every turn, and normalize canonical order entities against grounded results. Ask only for facts unresolved after the merge. Unit of measure comes from the catalog. Decide authorization semantically and emit place_order with the complete state when authorized.";
-        instructionSet += " For every product, SKU, availability, or active-ingredient lookup, set intent=FindProduct and searchQuery to only the most specific normalized catalog term inferred from the full conversation. Exclude conversational words such as find, show, products, and items from searchQuery. Never respond that a search is pending or that results will be provided later. When executedToolResults is present, retain searchQuery for traceability, do not request another lookup, and answer directly from the returned database results.";
+        instructionSet += " Treat generic catalog requests such as a product list, stock list, inventory list, available products, catalog, or any semantically equivalent wording as FindProduct searches. For a generic request covering the whole catalog, set searchQuery to an empty string and call search_products with an empty query so the application returns the product list. For a request containing a product name, item number, active ingredient, category, or other identifying term, set searchQuery to only the most specific normalized catalog term inferred from the full conversation. Exclude conversational words such as find, show, list, stock, inventory, catalog, products, and items from a specific searchQuery. Never respond that a search is pending or that results will be provided later. When executedToolResults is present, retain searchQuery for traceability, do not request another lookup, and answer directly from the returned database results.";
+        instructionSet += " For a grounded FindProduct response, populate searchSummary with exactly one short, natural sentence describing only the interpreted search dimension and grounded match count. Describe products whose names start with a prefix, products containing a canonical active ingredient, or products matching an item-number fragment. Never include individual product names, item numbers, packages, availability, or a numbered list in searchSummary because structured cards render those details. End the summary with a colon when matches exist. Set searchSummary to null for non-product-search intents.";
         instructionSet += " Maintain orderLines as the complete typed list of products currently in the draft. Each line must contain the canonical productId, itemNumber, productName, and quantity. When the user adds a product, append or merge that product without removing existing lines. When the user edits or removes a product, update only the referenced line. Always return every current line on subsequent turns, including turns that only provide shipping or PO information. Never emit place_order unless orderLines accurately represents everything shown in the review.";
         instructionSet += " Completing or correcting order details is not submission authorization. After the final required detail is supplied, return intent=ReviewDraft with the complete entities and orderLines, no missing fields or clarification questions, readyForSubmission=true, and do not emit place_order. Keep the draft open so the user can review it, add products, or edit it. Emit intent=SubmitOrder and place_order only when the latest user turn explicitly confirms submission of the reviewed draft; infer that confirmation semantically rather than matching fixed phrases.";
 
@@ -626,7 +629,7 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
         {
             var jsonObjectMessages = new object[] {
           new { role = "system", content = systemPrompt },
-          new { role = "system", content = instructionSet + " Return only a single valid JSON object with keys: status,intent,confidence,reply,searchQuery,entities,orderLines,missingFields,clarificationQuestions,toolCalls,grounding,escalate,escalationReason,unsupportedReason,readyForSubmission,policy." },
+          new { role = "system", content = instructionSet + " Return only a single valid JSON object with keys: status,intent,confidence,reply,searchQuery,searchSummary,entities,orderLines,missingFields,clarificationQuestions,toolCalls,grounding,escalate,escalationReason,unsupportedReason,readyForSubmission,policy." },
           new { role = "user", content = JsonSerializer.Serialize(userPayload, JsonOptions) }
         };
             var jsonObjectBody = new Dictionary<string, object?>
@@ -676,16 +679,18 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
                         if (!string.IsNullOrWhiteSpace(query))
                         {
                             var pattern = $"%{EscapeLikePattern(query)}%";
+                            var normalizedQuery = string.Concat(query.Where(char.IsLetterOrDigit)).ToUpperInvariant();
+                            var normalizedPattern = $"%{EscapeLikePattern(normalizedQuery)}%";
                             productQuery = productQuery.Where(p =>
                               EF.Functions.Like(p.Name, pattern, "\\")
                               || EF.Functions.Like(p.ItemNumber, pattern, "\\")
-                              || EF.Functions.Like(p.ActiveIngredients, pattern, "\\"));
+                              || EF.Functions.Like(p.ActiveIngredients, pattern, "\\")
+                              || EF.Functions.Like(p.SearchTextNormalized, normalizedPattern, "\\"));
                         }
 
                         var totalMatches = await productQuery.CountAsync(ct);
                         var data = await productQuery
                           .OrderBy(p => p.Name)
-                          .Take(20)
                           .ToListAsync(ct);
                         products.AddRange(data);
                         grounding.Add(new(
@@ -800,7 +805,9 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
       int historyCount,
       string inputHash,
       string outcome,
-      IReadOnlyList<AssistantOrderLine>? orderLines = null
+      IReadOnlyList<AssistantOrderLine>? orderLines = null,
+      string? searchQuery = null,
+      string? searchSummary = null
     )
     {
         return new AssistantResponse(
@@ -828,7 +835,9 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
             inputHash,
             outcome
           ),
-          orderLines
+          orderLines,
+          searchQuery,
+          searchSummary
         );
     }
 
@@ -882,6 +891,7 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
             Confidence = GetDouble(root, "confidence"),
             Reply = GetString(root, "reply"),
             SearchQuery = GetNullableString(root, "searchQuery"),
+            SearchSummary = GetNullableString(root, "searchSummary"),
             Escalate = GetBool(root, "escalate"),
             EscalationReason = GetNullableString(root, "escalationReason"),
             UnsupportedReason = GetNullableString(root, "unsupportedReason"),
@@ -1556,6 +1566,7 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
         public double? Confidence { get; set; }
         public string? Reply { get; set; }
         public string? SearchQuery { get; set; }
+        public string? SearchSummary { get; set; }
         public Dictionary<string, string?>? Entities { get; set; }
         public List<ModelOrderLine>? OrderLines { get; set; }
         public List<ModelMissingField>? MissingFields { get; set; }
@@ -1625,7 +1636,7 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
             type = "object",
             additionalProperties = false,
             required = new[] {
-        "status","intent","confidence","reply","searchQuery","entities","orderLines","missingFields","clarificationQuestions","toolCalls","grounding","escalate","escalationReason","unsupportedReason","readyForSubmission","policy"
+        "status","intent","confidence","reply","searchQuery","searchSummary","entities","orderLines","missingFields","clarificationQuestions","toolCalls","grounding","escalate","escalationReason","unsupportedReason","readyForSubmission","policy"
       },
             properties = new
             {
@@ -1634,6 +1645,7 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
                 confidence = new { type = "number", minimum = 0, maximum = 1 },
                 reply = new { type = "string" },
                 searchQuery = new { type = new[] { "string", "null" } },
+                searchSummary = new { type = new[] { "string", "null" }, maxLength = 220, description = "For grounded FindProduct only: one short sentence describing the interpreted search dimension and match count, without listing product details; otherwise null." },
                 entities = new
                 {
                     type = "object",
