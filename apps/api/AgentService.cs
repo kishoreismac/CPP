@@ -111,6 +111,34 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
         }
 
         var modelToolCalls = modelOutput.ToolCalls ?? [];
+        var catalogSearchOrchestrated = false;
+        if (!modelToolCalls.Any(t => string.Equals(t.Name, "search_products", StringComparison.OrdinalIgnoreCase))
+            && modelOutput.Policy?.PromptInjectionDetected != true
+            && conversationOrderLines.Count == 0
+            && string.IsNullOrWhiteSpace(FirstNonEmpty(
+              modelOutput.Entities ?? new Dictionary<string, string?>(),
+              "productId",
+              "itemNumber",
+              "productName",
+              "product")))
+        {
+            var catalogFragment = await FindCatalogFragmentAsync(message, ct);
+            if (!string.IsNullOrWhiteSpace(catalogFragment))
+            {
+                modelOutput.Intent = nameof(AssistantIntent.FindProduct);
+                modelOutput.SearchQuery = catalogFragment;
+                modelToolCalls.Add(new ModelToolCall
+                {
+                    Name = "search_products",
+                    Reason = "Application-orchestrated catalog lookup from a database-matched fragment in the user's request.",
+                    Arguments = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
+                    {
+                        ["query"] = catalogFragment
+                    }
+                });
+                catalogSearchOrchestrated = true;
+            }
+        }
         if (!modelToolCalls.Any(t => string.Equals(t.Name, "search_products", StringComparison.OrdinalIgnoreCase))
             && ParseIntent(modelOutput.Intent) == AssistantIntent.FindProduct
             && modelOutput.Policy?.PromptInjectionDetected != true)
@@ -183,6 +211,13 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
                     t.Reason ?? "Model-requested tool call after grounded lookup",
                     new Dictionary<string, string?>(t.Arguments, StringComparer.OrdinalIgnoreCase))));
                 modelOutput = followupOutput;
+                if (catalogSearchOrchestrated && toolResults.Products.Count > 0)
+                {
+                    modelOutput.Intent = nameof(AssistantIntent.FindProduct);
+                    modelOutput.SearchQuery ??= lookupToolCalls
+                      .Select(call => call.Arguments.GetValueOrDefault("query"))
+                      .FirstOrDefault(value => !string.IsNullOrWhiteSpace(value));
+                }
             }
             catch (Exception ex)
             {
@@ -482,12 +517,13 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
 
     async Task<string> BuildContextSnapshotAsync(string? orderId, IReadOnlyList<string> approvedTools, CancellationToken ct)
     {
-        var accounts = await db.Accounts
-          .AsNoTracking()
-          .OrderBy(x => x.Name)
-          .Select(x => new { x.Id, x.AccountNumber, x.Name, x.RequiresCustomerPo })
-          .Take(6)
-          .ToListAsync(ct);
+        var accounts = new
+        {
+            TotalCount = await db.Accounts.AsNoTracking().CountAsync(ct),
+            SearchTool = "get_accounts",
+            SearchableFields = new[] { "name", "accountNumber", "id" },
+            ResultLimit = 10
+        };
 
         var productCatalog = new
         {
@@ -546,7 +582,8 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
           "You are a CPP ordering assistant. Interpret user intent from the entire conversation, including natural-language confirmations, corrections, and rejections. Always return valid JSON that matches the schema. Keep transaction control in application code. Never claim submission unless you emit place_order in the same response.";
         var instructionSet = config["Agent:InstructionSet"] ??
           "The catalog can be arbitrarily large. Always call search_products for product, SKU, availability, or active-ingredient questions. Never infer absence from contextSnapshot or claim not-found without an executed catalog search returning zero matches. When executedToolResults is present, answer only from those results and do not repeat lookup calls. Maintain structured order state across the conversation. Merge contextEntities with new facts and corrections, return the complete state every turn, and normalize canonical order entities against grounded results. Ask only for facts unresolved after the merge. Unit of measure comes from the catalog. Decide authorization semantically and emit place_order with the complete state when authorized.";
-        instructionSet += " Treat generic catalog requests such as a product list, stock list, inventory list, available products, catalog, or any semantically equivalent wording as FindProduct searches. For a generic request covering the whole catalog, set searchQuery to an empty string and call search_products with an empty query so the application returns the product list. For a request containing a product name, item number, active ingredient, category, or other identifying term, set searchQuery to only the most specific normalized catalog term inferred from the full conversation. Exclude conversational words such as find, show, list, stock, inventory, catalog, products, and items from a specific searchQuery. Never respond that a search is pending or that results will be provided later. When executedToolResults is present, retain searchQuery for traceability, do not request another lookup, and answer directly from the returned database results.";
+        instructionSet += " Treat generic catalog requests such as a product list, stock list, inventory list, available products, catalog, or any semantically equivalent wording as FindProduct searches. Treat terse text fragments and abbreviations as potential product-name, item-number, or active-ingredient searches before interpreting them as account or shipping values. In an ambiguous phrase such as an order request containing an unresolved fragment, search the catalog first; never invent an account from that fragment. For a generic request covering the whole catalog, set searchQuery to an empty string and call search_products with an empty query so the application returns the product list. For a request containing a product name, item number, active ingredient, category, or other identifying term, set searchQuery to only the most specific normalized catalog term inferred from the full conversation. Exclude conversational words such as find, show, list, stock, inventory, catalog, products, and items from a specific searchQuery. Never respond that a search is pending or that results will be provided later. When executedToolResults is present, retain searchQuery for traceability, do not request another lookup, and answer directly from the returned database results.";
+        instructionSet += " The account directory may contain hundreds of Ship-To accounts and contextSnapshot contains only account-search metadata. After a product and quantity are selected, if the Ship-To account is unresolved, ask the user which Ship-To account to use without listing the whole directory. When the user supplies an account name, number, ID, city-like fragment, abbreviation, or partial value, call get_accounts with only that normalized fragment. Present the grounded matching accounts for selection and never invent an account. Once a canonical Ship-To account is selected, continue to delivery-location selection for that account.";
         instructionSet += " For a grounded FindProduct response, populate searchSummary with exactly one short, natural sentence describing only the interpreted search dimension and grounded match count. Describe products whose names start with a prefix, products containing a canonical active ingredient, or products matching an item-number fragment. Never include individual product names, item numbers, packages, availability, or a numbered list in searchSummary because structured cards render those details. End the summary with a colon when matches exist. Set searchSummary to null for non-product-search intents.";
         instructionSet += " Maintain orderLines as the complete typed list of products currently in the draft. Each line must contain the canonical productId, itemNumber, productName, and quantity. When the user adds a product, append or merge that product without removing existing lines. When the user edits or removes a product, update only the referenced line. Always return every current line on subsequent turns, including turns that only provide shipping or PO information. Never emit place_order unless orderLines accurately represents everything shown in the review.";
         instructionSet += " Completing or correcting order details is not submission authorization. After the final required detail is supplied, return intent=ReviewDraft with the complete entities and orderLines, no missing fields or clarification questions, readyForSubmission=true, and do not emit place_order. Keep the draft open so the user can review it, add products, or edit it. Emit intent=SubmitOrder and place_order only when the latest user turn explicitly confirms submission of the reviewed draft; infer that confirmation semantically rather than matching fixed phrases.";
@@ -707,14 +744,19 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
                 case "get_accounts":
                     {
                         var query = call.Arguments.TryGetValue("query", out var q) ? (q ?? string.Empty).Trim() : string.Empty;
-                        var accounts = await db.Accounts
-                          .AsNoTracking()
-                          .Where(a => string.IsNullOrWhiteSpace(query)
-                            || a.Id.Contains(query, StringComparison.OrdinalIgnoreCase)
-                            || a.Name.Contains(query, StringComparison.OrdinalIgnoreCase)
-                            || a.AccountNumber.Contains(query, StringComparison.OrdinalIgnoreCase))
+                        var accountQuery = db.Accounts.AsNoTracking().AsQueryable();
+                        if (!string.IsNullOrWhiteSpace(query))
+                        {
+                            var pattern = $"%{EscapeLikePattern(query)}%";
+                            accountQuery = accountQuery.Where(a =>
+                              EF.Functions.Like(a.Id, pattern, "\\")
+                              || EF.Functions.Like(a.Name, pattern, "\\")
+                              || EF.Functions.Like(a.AccountNumber, pattern, "\\")
+                              || EF.Functions.Like(a.City, pattern, "\\"));
+                        }
+                        var accounts = await accountQuery
                           .OrderBy(a => a.Name)
-                          .Take(3)
+                          .Take(10)
                           .ToListAsync(ct);
                         foreach (var account in accounts)
                         {
@@ -1394,6 +1436,46 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
             return await db.Products.AsNoTracking()
               .OrderBy(p => p.Name)
               .FirstOrDefaultAsync(p => EF.Functions.Like(p.Name, pattern, "\\"), ct);
+        }
+
+        return null;
+    }
+
+    async Task<string?> FindCatalogFragmentAsync(string message, CancellationToken ct)
+    {
+        var words = new string(message
+          .Select(character => char.IsLetterOrDigit(character) ? character : ' ')
+          .ToArray())
+          .Split(' ', StringSplitOptions.RemoveEmptyEntries)
+          .Where(word => word.Length >= 3)
+          .Take(12)
+          .ToArray();
+        if (words.Length == 0) return null;
+
+        var candidates = new List<string>();
+        for (var length = words.Length; length >= 1; length--)
+        {
+            for (var start = 0; start + length <= words.Length; start++)
+            {
+                var candidate = string.Join(' ', words.Skip(start).Take(length));
+                var normalized = string.Concat(candidate.Where(char.IsLetterOrDigit)).ToUpperInvariant();
+                if (normalized.Length >= 3 && !candidates.Contains(candidate, StringComparer.OrdinalIgnoreCase))
+                {
+                    candidates.Add(candidate);
+                }
+            }
+        }
+
+        foreach (var candidate in candidates)
+        {
+            var normalized = string.Concat(candidate.Where(char.IsLetterOrDigit)).ToUpperInvariant();
+            var normalizedPattern = $"%{EscapeLikePattern(normalized)}%";
+            if (await db.Products.AsNoTracking().AnyAsync(
+              product => EF.Functions.Like(product.SearchTextNormalized, normalizedPattern, "\\"),
+              ct))
+            {
+                return candidate;
+            }
         }
 
         return null;

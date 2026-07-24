@@ -2214,6 +2214,12 @@ function Assistant() {
   const [contextOrderLines, setContextOrderLines] = useState<
     AssistantOrderLine[]
   >([]);
+  const [productQuantities, setProductQuantities] = useState<
+    Record<string, number>
+  >({});
+  const [accountMatches, setAccountMatches] = useState<Account[]>([]);
+  const [accountSearchAttempted, setAccountSearchAttempted] = useState(false);
+  const [addingProduct, setAddingProduct] = useState(false);
   const [messages, setMessages] = useState<
     {
       role: "assistant" | "user";
@@ -2251,7 +2257,7 @@ function Assistant() {
   const activeIngredientChoices = Array.from(
     new Set(
       (catalog.data ?? [])
-        .flatMap((product) => product.activeIngredients.split(/[,;]/))
+        .flatMap((product) => product.activeIngredients.split(";"))
         .map((ingredient) => ingredient.trim())
         .filter(Boolean),
     ),
@@ -2413,10 +2419,69 @@ function Assistant() {
     },
   });
 
-  function go(v = text) {
+  function updateActiveReview(entityUpdates: Record<string, string | null>) {
+    const nextEntities = { ...contextEntities, ...entityUpdates };
+    Object.keys(nextEntities).forEach((key) => {
+      if (!nextEntities[key]) delete nextEntities[key];
+    });
+    setContextEntities(nextEntities);
+    setMessages((current) => {
+      const reviewIndex = current.findLastIndex(
+        (message) =>
+          message.role === "assistant" &&
+          message.entities &&
+          hasOrderReviewDetails(message.entities, message.orderLines),
+      );
+      return current.map((message, index) =>
+        index === reviewIndex
+          ? { ...message, entities: nextEntities }
+          : message,
+      );
+    });
+  }
+
+  const searchAccounts = useMutation({
+    mutationFn: (value: string) =>
+      api<Account[]>(
+        `/accounts/search?q=${encodeURIComponent(value)}&limit=10`,
+      ),
+    onSuccess: (matches) => {
+      setAccountMatches(matches);
+      setAccountSearchAttempted(true);
+      setMessages((current) => {
+        const review = [...current]
+          .reverse()
+          .find(
+            (message) =>
+              message.role === "assistant" &&
+              message.entities &&
+              hasOrderReviewDetails(message.entities, message.orderLines),
+          );
+        if (!review) return current;
+        return [
+          ...current,
+          {
+            ...review,
+            text: "",
+            products: undefined,
+            clarificationQuestions: [],
+            grounding: [],
+            traceId: undefined,
+          },
+        ];
+      });
+    },
+  });
+
+  function go(v = text, bypassGuidedFlow = false) {
     if (!v.trim()) return;
     setMessages((m) => [...m, { role: "user", text: v }]);
-    send.mutate(v);
+    const awaitingAccount =
+      !bypassGuidedFlow &&
+      contextOrderLines.length > 0 &&
+      !firstEntity(contextEntities, "shipToAccountId");
+    if (awaitingAccount) searchAccounts.mutate(v);
+    else send.mutate(v);
     setText("");
   }
 
@@ -2426,6 +2491,10 @@ function Assistant() {
     setContextOrderLines([]);
     setMessages([{ role: "assistant", text: assistantWelcomeMessage }]);
     setCatalogChoiceMode(null);
+    setProductQuantities({});
+    setAccountMatches([]);
+    setAccountSearchAttempted(false);
+    setAddingProduct(false);
     setText("");
     send.reset();
   }
@@ -2463,7 +2532,12 @@ function Assistant() {
           <div className="chat-log" ref={chatLogRef}>
             {messages.map((m, i) => (
               <div className={m.role} key={i}>
-                {m.intent === "FindProduct" ? (
+                {m.products?.length &&
+                ((addingProduct && i === messages.length - 1) ||
+                  !(
+                    m.entities &&
+                    hasOrderReviewDetails(m.entities, m.orderLines)
+                  )) ? (
                   m.searchSummary ? (
                     <p className="assistant-search-summary">
                       {m.searchSummary}
@@ -2472,8 +2546,15 @@ function Assistant() {
                 ) : (
                   m.text
                 )}
-                {m.intent !== "FindProduct" &&
-                  !!m.clarificationQuestions?.length && (
+                {(!m.products?.length ||
+                  (m.entities &&
+                    hasOrderReviewDetails(m.entities, m.orderLines) &&
+                    !(addingProduct && i === messages.length - 1))) &&
+                  !!m.clarificationQuestions?.length &&
+                  !(
+                    m.entities &&
+                    hasOrderReviewDetails(m.entities, m.orderLines)
+                  ) && (
                     <div className="assistant-block">
                       <b>Needed to continue</b>
                       {m.clarificationQuestions.map((q) => (
@@ -2481,51 +2562,123 @@ function Assistant() {
                       ))}
                     </div>
                   )}
-                {m.intent === "FindProduct" &&
-                  m.products?.map((p) => (
-                    <button
-                      type="button"
-                      className="sku"
-                      key={p.id}
-                      disabled={send.isPending}
-                      aria-label={`Select ${p.name}, item ${p.itemNumber}`}
-                      onClick={() =>
-                        go(`I want to order ${p.name} (Item #${p.itemNumber}).`)
-                      }
-                    >
-                      <div className="sku-head">
-                        <b>{p.name}</b>
-                        <span className="sku-head-actions">
-                          <span
-                            className={`sku-status ${p.stoplightStatus.toLowerCase()}`}
-                          >
-                            {p.stoplightStatus}
+                {!!m.products?.length &&
+                  ((addingProduct && i === messages.length - 1) ||
+                    !(
+                      m.entities &&
+                      hasOrderReviewDetails(m.entities, m.orderLines)
+                    )) &&
+                  m.products.map((p) => {
+                    const minimum = Math.max(1, p.minimumQuantity || 1);
+                    const increment = Math.max(1, p.quantityIncrement || 1);
+                    const maximum = Math.max(
+                      minimum,
+                      p.maximumQuantity || 9999,
+                    );
+                    const quantity = productQuantities[p.id] ?? minimum;
+                    return (
+                      <div className="sku" key={p.id}>
+                        <div className="sku-head">
+                          <b>{p.name}</b>
+                          <span className="sku-head-actions">
+                            <span
+                              className={`sku-status ${p.stoplightStatus.toLowerCase()}`}
+                            >
+                              {p.stoplightStatus}
+                            </span>
                           </span>
-                          <ChevronRight size={16} aria-hidden="true" />
-                        </span>
+                        </div>
+                        <small>
+                          {p.itemNumber} · {p.packageSize}
+                        </small>
+                        <small className="sku-ingredient">
+                          Active ingredient: {p.activeIngredients}
+                        </small>
+                        <div className="sku-order-actions">
+                          <span className="sku-quantity-label">Quantity</span>
+                          <span className="sku-quantity-control">
+                            <button
+                              type="button"
+                              disabled={send.isPending || quantity <= minimum}
+                              aria-label={`Decrease quantity of ${p.name}`}
+                              onClick={() =>
+                                setProductQuantities((current) => ({
+                                  ...current,
+                                  [p.id]: Math.max(
+                                    minimum,
+                                    quantity - increment,
+                                  ),
+                                }))
+                              }
+                            >
+                              <Minus size={14} />
+                            </button>
+                            <b aria-label={`Quantity ${quantity}`}>
+                              {quantity}
+                            </b>
+                            <button
+                              type="button"
+                              disabled={send.isPending || quantity >= maximum}
+                              aria-label={`Increase quantity of ${p.name}`}
+                              onClick={() =>
+                                setProductQuantities((current) => ({
+                                  ...current,
+                                  [p.id]: Math.min(
+                                    maximum,
+                                    quantity + increment,
+                                  ),
+                                }))
+                              }
+                            >
+                              <Plus size={14} />
+                            </button>
+                          </span>
+                          <button
+                            type="button"
+                            className="sku-add"
+                            disabled={send.isPending}
+                            aria-label={`Add ${quantity} of ${p.name} to order`}
+                            onClick={() => {
+                              setAddingProduct(false);
+                              go(
+                                `I want to order ${quantity} units of ${p.name} (Item #${p.itemNumber}).`,
+                                true,
+                              );
+                            }}
+                          >
+                            Add to order <ChevronRight size={14} />
+                          </button>
+                        </div>
                       </div>
-                      <small>
-                        {p.itemNumber} · {p.packageSize}
-                      </small>
-                      <small className="sku-ingredient">
-                        Active ingredient: {p.activeIngredients}
-                      </small>
-                    </button>
-                  ))}
+                    );
+                  })}
                 {m.entities &&
                   m.status !== "Complete" &&
+                  !(
+                    addingProduct &&
+                    i === messages.length - 1 &&
+                    m.products?.length
+                  ) &&
                   hasOrderReviewDetails(m.entities, m.orderLines) && (
                     <AssistantOrderReview
                       entities={m.entities}
                       orderLines={m.orderLines ?? []}
                       missingFields={m.missingFields ?? []}
-                      hasOutstandingQuestions={Boolean(
-                        m.clarificationQuestions?.length,
-                      )}
-                      busy={send.isPending || editDraft.isPending}
+                      accountMatches={
+                        i === messages.length - 1 ? accountMatches : []
+                      }
+                      accountSearchAttempted={
+                        i === messages.length - 1 && accountSearchAttempted
+                      }
+                      busy={
+                        send.isPending ||
+                        editDraft.isPending ||
+                        searchAccounts.isPending
+                      }
                       onConfirm={() =>
                         go(
                           "Confirm and submit this order using the reviewed details.",
+                          true,
                         )
                       }
                       onEdit={() =>
@@ -2534,8 +2687,33 @@ function Assistant() {
                           orderLines: m.orderLines ?? [],
                         })
                       }
-                      onAddProduct={() =>
-                        go("I want to add another product to this order.")
+                      onAddProduct={() => {
+                        setAddingProduct(true);
+                        go(
+                          "I want to add another product to this order.",
+                          true,
+                        );
+                      }}
+                      onSelectAccount={(account) => {
+                        setAccountMatches([]);
+                        setAccountSearchAttempted(false);
+                        updateActiveReview({
+                          shipToAccountId: account.id,
+                          shipToAccountName: account.name,
+                          deliverToId: null,
+                          deliverToName: null,
+                          customerPo: null,
+                        });
+                      }}
+                      onSelectDelivery={(delivery) =>
+                        updateActiveReview({
+                          deliverToId: delivery.id,
+                          deliverToName: delivery.name,
+                          customerPo: null,
+                        })
+                      }
+                      onCustomerPo={(customerPo) =>
+                        updateActiveReview({ customerPo })
                       }
                       onQuantityChange={(lineIndex, quantity) => {
                         const currentLines = m.orderLines?.length
@@ -2681,25 +2859,92 @@ function Assistant() {
                             <ChevronRight size={16} />
                           </button>
                         ))
-                      : productChoices.map((product) => (
-                          <button
-                            key={product.id}
-                            onClick={() => {
-                              setCatalogChoiceMode(null);
-                              go(
-                                `I want to order ${product.name} (Item #${product.itemNumber}).`,
-                              );
-                            }}
-                          >
-                            <span>
-                              <b>{product.name}</b>
-                              <small>
-                                {product.itemNumber} · {product.packageSize}
-                              </small>
-                            </span>
-                            <ChevronRight size={16} />
-                          </button>
-                        ))}
+                      : productChoices.map((product) => {
+                          const minimum = Math.max(
+                            1,
+                            product.minimumQuantity || 1,
+                          );
+                          const increment = Math.max(
+                            1,
+                            product.quantityIncrement || 1,
+                          );
+                          const maximum = Math.max(
+                            minimum,
+                            product.maximumQuantity || 9999,
+                          );
+                          const quantity =
+                            productQuantities[product.id] ?? minimum;
+                          return (
+                            <div
+                              className="assistant-picker-product"
+                              key={product.id}
+                            >
+                              <span>
+                                <small>Product name</small>
+                                <b>{product.name}</b>
+                                <small>
+                                  {product.itemNumber} · {product.packageSize}
+                                </small>
+                              </span>
+                              <div className="assistant-picker-product-actions">
+                                <span className="sku-quantity-control">
+                                  <button
+                                    type="button"
+                                    disabled={
+                                      send.isPending || quantity <= minimum
+                                    }
+                                    aria-label={`Decrease quantity of ${product.name}`}
+                                    onClick={() =>
+                                      setProductQuantities((current) => ({
+                                        ...current,
+                                        [product.id]: Math.max(
+                                          minimum,
+                                          quantity - increment,
+                                        ),
+                                      }))
+                                    }
+                                  >
+                                    <Minus size={14} />
+                                  </button>
+                                  <b>{quantity}</b>
+                                  <button
+                                    type="button"
+                                    disabled={
+                                      send.isPending || quantity >= maximum
+                                    }
+                                    aria-label={`Increase quantity of ${product.name}`}
+                                    onClick={() =>
+                                      setProductQuantities((current) => ({
+                                        ...current,
+                                        [product.id]: Math.min(
+                                          maximum,
+                                          quantity + increment,
+                                        ),
+                                      }))
+                                    }
+                                  >
+                                    <Plus size={14} />
+                                  </button>
+                                </span>
+                                <button
+                                  type="button"
+                                  className="sku-add"
+                                  disabled={send.isPending}
+                                  onClick={() => {
+                                    setCatalogChoiceMode(null);
+                                    setAddingProduct(false);
+                                    go(
+                                      `I want to order ${quantity} units of ${product.name} (Item #${product.itemNumber}).`,
+                                      true,
+                                    );
+                                  }}
+                                >
+                                  Add <ChevronRight size={14} />
+                                </button>
+                              </div>
+                            </div>
+                          );
+                        })}
                   </div>
                 )}
               </section>
@@ -2748,32 +2993,40 @@ function hasOrderReviewDetails(
     "productId",
   );
   const quantity = firstEntity(entities, "quantity");
-  const account = firstEntity(entities, "shipToAccountName", "shipToAccountId");
   const hasLines = Boolean(orderLines?.some((line) => line.quantity > 0));
-  return Boolean(account && (hasLines || (product && quantity)));
+  return Boolean(hasLines || (product && quantity));
 }
 
 function AssistantOrderReview({
   entities,
   orderLines,
   missingFields,
-  hasOutstandingQuestions,
+  accountMatches,
+  accountSearchAttempted,
   busy,
   onConfirm,
   onEdit,
   onAddProduct,
+  onSelectAccount,
+  onSelectDelivery,
+  onCustomerPo,
   onQuantityChange,
 }: {
   entities: Record<string, string | null>;
   orderLines: AssistantOrderLine[];
   missingFields: AssistantMissingField[];
-  hasOutstandingQuestions: boolean;
+  accountMatches: Account[];
+  accountSearchAttempted: boolean;
   busy: boolean;
   onConfirm: () => void;
   onEdit: () => void;
   onAddProduct: () => void;
+  onSelectAccount: (account: Account) => void;
+  onSelectDelivery: (delivery: DeliverTo) => void;
+  onCustomerPo: (customerPo: string) => void;
   onQuantityChange: (lineIndex: number, quantity: number) => void;
 }) {
+  const [poInput, setPoInput] = useState("");
   const product = firstEntity(
     entities,
     "productName",
@@ -2782,9 +3035,26 @@ function AssistantOrderReview({
   );
   const itemNumber = firstEntity(entities, "itemNumber");
   const quantity = firstEntity(entities, "quantity");
-  const account = firstEntity(entities, "shipToAccountName", "shipToAccountId");
   const delivery = firstEntity(entities, "deliverToName", "deliverToId");
   const customerPo = firstEntity(entities, "customerPo");
+  const explicitAccountId = firstEntity(entities, "shipToAccountId");
+  const { data: selectedAccount } = useQuery<Account>({
+    queryKey: ["account", explicitAccountId],
+    queryFn: () => api(`/accounts/${explicitAccountId}`),
+    enabled: Boolean(explicitAccountId),
+  });
+  const { data: deliveryLocations = [] } = useQuery<DeliverTo[]>({
+    queryKey: ["deliver-to", selectedAccount?.id],
+    queryFn: () => api(`/accounts/${selectedAccount?.id}/deliver-to-locations`),
+    enabled: Boolean(selectedAccount?.id),
+  });
+  const selectedDelivery = deliveryLocations.find(
+    (candidate) =>
+      candidate.id ===
+        firstEntity(entities, "deliverToAccountId", "deliverToId") ||
+      candidate.name.toLowerCase() === delivery?.toLowerCase(),
+  );
+  useEffect(() => setPoInput(customerPo ?? ""), [customerPo]);
   const reviewLines = orderLines.length
     ? orderLines
     : [
@@ -2796,8 +3066,9 @@ function AssistantOrderReview({
       ];
   const ready =
     missingFields.length === 0 &&
-    !hasOutstandingQuestions &&
-    Boolean(delivery) &&
+    Boolean(selectedAccount) &&
+    Boolean(selectedDelivery) &&
+    (!selectedAccount?.requiresCustomerPo || Boolean(customerPo)) &&
     reviewLines.every(
       (line) =>
         line.quantity > 0 &&
@@ -2822,9 +3093,40 @@ function AssistantOrderReview({
         <Truck size={15} />
         <span>
           <small>Ship-to account</small>
-          <b>{account}</b>
+          <b>
+            {selectedAccount?.name ?? "Which Ship-To account should I use?"}
+          </b>
         </span>
       </div>
+      {!selectedAccount && (
+        <div className="assistant-choice-section">
+          <small>1 · Select Ship-To account</small>
+          {accountMatches.length ? (
+            <div className="assistant-choice-grid">
+              {accountMatches.map((candidate) => (
+                <button
+                  type="button"
+                  disabled={busy}
+                  key={candidate.id}
+                  onClick={() => onSelectAccount(candidate)}
+                >
+                  <span>
+                    <b>{candidate.name}</b>
+                    <small>Account #{candidate.accountNumber}</small>
+                  </span>
+                  <ChevronRight size={15} />
+                </button>
+              ))}
+            </div>
+          ) : (
+            <p className="assistant-choice-hint">
+              {accountSearchAttempted
+                ? "No matching Ship-To accounts were found. Try another account name."
+                : "Enter the Ship-To account you want to use in the chat box."}
+            </p>
+          )}
+        </div>
+      )}
       <div className="assistant-order-lines">
         {reviewLines.map((line, index) => {
           const lineName =
@@ -2877,15 +3179,59 @@ function AssistantOrderReview({
           );
         })}
       </div>
-      <dl className="assistant-order-facts">
-        <div>
-          <dt>Delivery</dt>
-          <dd>{delivery ?? "Not selected"}</dd>
+      {selectedAccount && !selectedDelivery && (
+        <div className="assistant-choice-section">
+          <small>2 · Select delivery location</small>
+          <div className="assistant-choice-grid">
+            {deliveryLocations.map((candidate) => (
+              <button
+                type="button"
+                disabled={busy}
+                key={candidate.id}
+                onClick={() => onSelectDelivery(candidate)}
+              >
+                <span>
+                  <b>{candidate.name}</b>
+                  <small>
+                    {candidate.addressLine1} · {candidate.city}
+                  </small>
+                </span>
+                <ChevronRight size={15} />
+              </button>
+            ))}
+          </div>
         </div>
-        {customerPo && (
+      )}
+      <dl className="assistant-order-facts">
+        {selectedDelivery && (
           <div>
-            <dt>Customer PO</dt>
-            <dd>{customerPo}</dd>
+            <dt>Delivery</dt>
+            <dd>{selectedDelivery.name}</dd>
+          </div>
+        )}
+        {selectedAccount?.requiresCustomerPo && selectedDelivery && (
+          <div>
+            <dt>3 · Customer PO</dt>
+            <dd className="assistant-po-entry">
+              <input
+                aria-label="Customer PO number"
+                disabled={busy}
+                value={poInput}
+                placeholder="Enter PO number"
+                onChange={(event) => setPoInput(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" && poInput.trim())
+                    onCustomerPo(poInput.trim());
+                }}
+              />
+              <button
+                type="button"
+                disabled={busy || !poInput.trim() || poInput === customerPo}
+                onClick={() => onCustomerPo(poInput.trim())}
+              >
+                Apply
+              </button>
+            </dd>
           </div>
         )}
       </dl>
