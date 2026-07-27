@@ -132,6 +132,7 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
                 }
             });
         }
+        var catalogSearchOrchestrated = modelToolCalls.Any(call => IsProductSearchTool(call.Name));
         if (!modelToolCalls.Any(t => string.Equals(t.Name, "place_order", StringComparison.OrdinalIgnoreCase))
             && ParseIntent(modelOutput.Intent) == AssistantIntent.SubmitOrder
             && modelOutput.Policy?.PromptInjectionDetected != true
