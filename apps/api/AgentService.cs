@@ -111,7 +111,11 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
         }
 
         var modelToolCalls = modelOutput.ToolCalls ?? [];
-        var fallbackSearchTool = InferProductSearchTool(message);
+        var fallbackSearchTool = await InferProductSearchToolAsync(message, modelOutput.SearchQuery, ct);
+        foreach (var call in modelToolCalls)
+        {
+            call.Name = NormalizeProductSearchToolName(call.Name, fallbackSearchTool);
+        }
         if (!modelToolCalls.Any(t => IsProductSearchTool(t.Name))
             && ParseIntent(modelOutput.Intent) == AssistantIntent.FindProduct
             && modelOutput.Policy?.PromptInjectionDetected != true
@@ -764,13 +768,35 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
       || name.Equals("search_products_by_item_number", StringComparison.OrdinalIgnoreCase)
       || name.Equals("search_products_by_active_ingredient", StringComparison.OrdinalIgnoreCase));
 
-    static string? InferProductSearchTool(string message)
+    async Task<string?> InferProductSearchToolAsync(string message, string? searchQuery, CancellationToken ct)
     {
         var normalized = message.ToLowerInvariant();
         if (normalized.Contains("item number") || normalized.Contains("item #") || normalized.Contains("sku") || normalized.Contains("product code")) return "search_products_by_item_number";
         if (normalized.Contains("active ingredient") || normalized.Contains("ingredient") || normalized.Contains("contains")) return "search_products_by_active_ingredient";
         if (normalized.Contains("product name") || normalized.Contains("named") || normalized.Contains("called")) return "search_products_by_name";
-        return null;
+        if (string.IsNullOrWhiteSpace(searchQuery)) return null;
+
+        var nameMatches = await productSearch.SearchByNameAsync(searchQuery, false, 1, ct);
+        var itemMatches = await productSearch.SearchByItemNumberAsync(searchQuery, false, 1, ct);
+        var ingredientMatches = await productSearch.SearchByActiveIngredientAsync(searchQuery, false, 1, ct);
+        var categoriesWithMatches = new[]
+        {
+            (Tool: "search_products_by_name", Count: nameMatches.TotalMatches),
+            (Tool: "search_products_by_item_number", Count: itemMatches.TotalMatches),
+            (Tool: "search_products_by_active_ingredient", Count: ingredientMatches.TotalMatches)
+        }.Where(result => result.Count > 0).ToList();
+        return categoriesWithMatches.Count == 1 ? categoriesWithMatches[0].Tool : null;
+    }
+
+    static string NormalizeProductSearchToolName(string? name, string? inferredTool)
+    {
+        if (string.IsNullOrWhiteSpace(name)) return string.Empty;
+        if (IsProductSearchTool(name)) return name;
+        if (!name.StartsWith("search_products", StringComparison.OrdinalIgnoreCase)) return name;
+        if (name.Contains("ingredient", StringComparison.OrdinalIgnoreCase)) return "search_products_by_active_ingredient";
+        if (name.Contains("item", StringComparison.OrdinalIgnoreCase) || name.Contains("sku", StringComparison.OrdinalIgnoreCase)) return "search_products_by_item_number";
+        if (name.Contains("name", StringComparison.OrdinalIgnoreCase)) return "search_products_by_name";
+        return inferredTool ?? name;
     }
 
     static AssistantStatus ParseStatus(string? value) => Enum.TryParse<AssistantStatus>(value ?? string.Empty, true, out var parsed)
