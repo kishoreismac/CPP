@@ -5,6 +5,14 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddDbContext<AppDb>(o => o.UseSqlite(builder.Configuration.GetConnectionString("Cpp") ?? "Data Source=cpp-v3.db"));
 builder.Services.AddMemoryCache();
 builder.Services.AddScoped<IProductSearchService, ProductSearchService>();
+builder.Services.AddHttpClient<IProductCatalogClient, ProductCatalogClient>((sp, client) =>
+{
+    var cfg = sp.GetRequiredService<IConfiguration>();
+    var configuredBaseUrl = cfg["ProductApi:BaseUrl"];
+    var baseUrl = string.IsNullOrWhiteSpace(configuredBaseUrl) ? "http://127.0.0.1:5090/" : configuredBaseUrl;
+    client.BaseAddress = new Uri(baseUrl.EndsWith('/') ? baseUrl : baseUrl + "/");
+    client.Timeout = TimeSpan.FromSeconds(cfg.GetValue<int?>("ProductApi:TimeoutSeconds") ?? 30);
+});
 builder.Services.AddScoped<IOrderRuleService, OrderRuleService>(); builder.Services.AddSingleton<IFulfillmentGateway, MockJdeFulfillmentGateway>();
 builder.Services.AddHttpClient<IAssistantAgentService, AssistantAgentService>((sp, http) =>
 {

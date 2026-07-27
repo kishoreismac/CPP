@@ -14,7 +14,7 @@ public interface IAssistantAgentService
     Task<AssistantHealthResponse> CheckHealthAsync(CancellationToken ct);
 }
 
-public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient httpClient, IProductSearchService productSearch, IOrderRuleService rules, IFulfillmentGateway fulfillment, IMemoryCache memory) : IAssistantAgentService
+public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient httpClient, IProductSearchService productSearch, IProductCatalogClient productCatalogClient, IOrderRuleService rules, IFulfillmentGateway fulfillment, IMemoryCache memory) : IAssistantAgentService
 {
     static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
     {
@@ -111,28 +111,15 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
         }
 
         var modelToolCalls = modelOutput.ToolCalls ?? [];
-        var fallbackSearchTool = await InferProductSearchToolAsync(message, modelOutput.SearchQuery, ct);
-        foreach (var call in modelToolCalls)
-        {
-            call.Name = NormalizeProductSearchToolName(call.Name, fallbackSearchTool);
-        }
-        if (!modelToolCalls.Any(t => IsProductSearchTool(t.Name))
-            && ParseIntent(modelOutput.Intent) == AssistantIntent.FindProduct
-            && modelOutput.Policy?.PromptInjectionDetected != true
-            && !string.IsNullOrWhiteSpace(modelOutput.SearchQuery)
-            && fallbackSearchTool is not null)
-        {
-            modelToolCalls.Add(new ModelToolCall
-            {
-                Name = fallbackSearchTool,
-                Reason = "Application-orchestrated category-specific catalog lookup from the model's structured FindProduct decision.",
-                Arguments = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
-                {
-                    ["query"] = modelOutput.SearchQuery?.Trim() ?? string.Empty
-                }
-            });
-        }
-        var catalogSearchOrchestrated = modelToolCalls.Any(call => IsProductSearchTool(call.Name));
+        var legacyProductCall = modelToolCalls.FirstOrDefault(call => IsLegacyProductSearchTool(call.Name));
+        var searchCategory = NormalizeSearchCategory(modelOutput.SearchCategory)
+          ?? SearchCategoryFromLegacyTool(legacyProductCall?.Name)
+          ?? InferSearchCategoryFromMessage(message);
+        modelToolCalls = modelToolCalls.Where(call => !IsLegacyProductSearchTool(call.Name)).ToList();
+        var catalogSearchOrchestrated = ParseIntent(modelOutput.Intent) == AssistantIntent.FindProduct
+          && modelOutput.Policy?.PromptInjectionDetected != true
+          && searchCategory is not null
+          && modelOutput.SearchQuery is not null;
         if (!modelToolCalls.Any(t => string.Equals(t.Name, "place_order", StringComparison.OrdinalIgnoreCase))
             && ParseIntent(modelOutput.Intent) == AssistantIntent.SubmitOrder
             && modelOutput.Policy?.PromptInjectionDetected != true
@@ -152,16 +139,32 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
           .ToList();
 
         var toolResults = await ExecuteToolCallsAsync(acceptedToolCalls, ct);
+        if (catalogSearchOrchestrated)
+        {
+            try
+            {
+                var apiProducts = await productCatalogClient.SearchAsync(searchCategory!, modelOutput.SearchQuery ?? string.Empty, ct);
+                toolResults.Products.AddRange(apiProducts);
+                toolResults.Grounding.Add(new AssistantGrounding("product-api", modelOutput.SearchQuery ?? "all-products", $"External {searchCategory} API returned {apiProducts.Count} product(s)."));
+                foreach (var product in apiProducts) toolResults.Grounding.Add(new AssistantGrounding("product", product.Id, $"{product.Name} ({product.ItemNumber}); active ingredient: {product.ActiveIngredients}; availability: {product.StoplightStatus}."));
+                modelOutput.SearchCategory = searchCategory;
+            }
+            catch (Exception ex)
+            {
+                return BuildResponse(conversationId, AssistantStatus.Escalated, AssistantIntent.FindProduct, 0, "The product API is temporarily unavailable. Please retry.", conversationEntities, [], [], acceptedToolCalls, [], [], true, TrimForAudit(ex.Message), null, new AssistantPolicyResult(false, true, true, "api-key", TrimForAudit(ex.Message)), version, startedAt, request.History?.Count ?? 0, inputHash, "escalated");
+            }
+        }
 
         var lookupToolCalls = acceptedToolCalls
           .Where(c => !string.Equals(c.Name, "place_order", StringComparison.OrdinalIgnoreCase))
           .ToList();
-        if (lookupToolCalls.Count > 0)
+        if (lookupToolCalls.Count > 0 || catalogSearchOrchestrated)
         {
             var executedToolResults = new
             {
-                instructions = "Generate the final grounded response from these database results. Set searchSummary to one short sentence that identifies what matched and the count, for example a product-name prefix, canonical active ingredient, or item-number fragment. The summary must not contain any individual product name, item number, package, availability, or numbered list because the application renders product cards separately. End searchSummary with a colon when matches exist. Keep reply concise as well. Do not repeat lookup tool calls. Never claim that a product is absent unless the catalog-search result reports zero matches.",
+                instructions = "Generate the final grounded response from these external API results. Set searchSummary to one short sentence identifying the search category and match count. Do not invent product data. The application renders product cards separately.",
                 calls = lookupToolCalls,
+                productApiRequest = catalogSearchOrchestrated ? new { category = searchCategory, query = modelOutput.SearchQuery } : null,
                 products = toolResults.Products.Take(50).Select(p => new
                 {
                     p.Id,
@@ -181,6 +184,7 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
             {
                 var followupOutput = await GetModelDecisionAsync(effectiveRequest, contextSnapshot, apiConfig, ct, executedToolResults);
                 followupOutput.SearchQuery ??= modelOutput.SearchQuery;
+                followupOutput.SearchCategory ??= modelOutput.SearchCategory;
                 var followupToolCalls = followupOutput.ToolCalls ?? [];
                 modelToolCalls.AddRange(followupToolCalls);
                 acceptedToolCalls.AddRange(followupToolCalls
@@ -194,9 +198,7 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
                 if (catalogSearchOrchestrated && toolResults.Products.Count > 0)
                 {
                     modelOutput.Intent = nameof(AssistantIntent.FindProduct);
-                    modelOutput.SearchQuery ??= lookupToolCalls
-                      .Select(call => call.Arguments.GetValueOrDefault("query"))
-                      .FirstOrDefault(value => !string.IsNullOrWhiteSpace(value));
+                    modelOutput.SearchQuery ??= effectiveRequest.Message;
                 }
             }
             catch (Exception ex)
@@ -508,7 +510,7 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
         var productCatalog = new
         {
             TotalCount = await db.Products.AsNoTracking().CountAsync(ct),
-            SearchTools = new[] { "search_products_by_name", "search_products_by_item_number", "search_products_by_active_ingredient" },
+            SearchApis = new[] { "api/products/search-by-name", "api/products/search-by-item-number", "api/products/search-by-active-ingredient" },
             SearchableFields = new[] { "name", "itemNumber", "activeIngredient" },
             ResultPageSize = 20
         };
@@ -561,12 +563,13 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
         var systemPrompt = config["Agent:SystemPrompt"] ??
           "You are a CPP ordering assistant. Interpret user intent from the entire conversation, including natural-language confirmations, corrections, and rejections. Always return valid JSON that matches the schema. Keep transaction control in application code. Never claim submission unless you emit place_order in the same response.";
         var instructionSet = config["Agent:InstructionSet"] ??
-          "The catalog can be arbitrarily large. Use search_products_by_name for product-name requests, search_products_by_item_number for item/SKU requests, and search_products_by_active_ingredient for ingredient requests. If the category is ambiguous, ask whether the value is a product name, item number, or active ingredient instead of guessing. Never infer absence from contextSnapshot or claim not-found without an executed catalog search returning zero matches. When executedToolResults is present, answer only from those results and do not repeat lookup calls. Maintain structured order state across the conversation. Merge contextEntities with new facts and corrections, return the complete state every turn, and normalize canonical order entities against grounded results. Ask only for facts unresolved after the merge. Unit of measure comes from the catalog. Decide authorization semantically and emit place_order with the complete state when authorized.";
-        instructionSet += " Treat generic catalog requests such as a product list, stock list, inventory list, available products, catalog, or any semantically equivalent wording as FindProduct searches. Treat terse text fragments and abbreviations as potential product-name, item-number, or active-ingredient searches before interpreting them as account or shipping values. In an ambiguous phrase such as an order request containing an unresolved fragment, search the catalog first; never invent an account from that fragment. For a generic whole-catalog request, set searchQuery to an empty string and call search_products_by_name with an empty query. For a specific request, select exactly one category tool and set searchQuery to only the most specific normalized catalog term. Exclude conversational words such as find, show, list, stock, inventory, catalog, products, and items from searchQuery. Never respond that a search is pending or that results will be provided later. When executedToolResults is present, retain searchQuery for traceability, do not request another lookup, and answer directly from the returned database results.";
+          "For product searches, classify the request only: set intent=FindProduct, searchCategory to productName, itemNumber, or activeIngredient, and searchQuery to the normalized value. Never emit a product search tool call; application code calls the external product API. If the category is ambiguous, set searchCategory=null and ask whether the value is a product name, item number, or active ingredient. When executedToolResults is present, answer only from those external API results. Maintain structured order state across the conversation and keep transaction control in application code.";
+        instructionSet += " Treat generic catalog requests as FindProduct with searchCategory=productName and searchQuery empty. Treat terse fragments as ambiguous unless conversation history identifies the category. Exclude words such as find, show, list, stock, inventory, catalog, products, and items from searchQuery. Never say a search is pending. Product toolCalls must remain empty because the backend performs HTTP API routing from searchCategory.";
         instructionSet += " The account directory may contain hundreds of Ship-To accounts and contextSnapshot contains only account-search metadata. After a product and quantity are selected, if the Ship-To account is unresolved, ask the user which Ship-To account to use without listing the whole directory. When the user supplies an account name, number, ID, city-like fragment, abbreviation, or partial value, call get_accounts with only that normalized fragment. Present the grounded matching accounts for selection and never invent an account. Once a canonical Ship-To account is selected, continue to delivery-location selection for that account.";
         instructionSet += " For a grounded FindProduct response, populate searchSummary with exactly one short, natural sentence describing only the interpreted search dimension and grounded match count. Describe products whose names start with a prefix, products containing a canonical active ingredient, or products matching an item-number fragment. Never include individual product names, item numbers, packages, availability, or a numbered list in searchSummary because structured cards render those details. End the summary with a colon when matches exist. Set searchSummary to null for non-product-search intents.";
         instructionSet += " Maintain orderLines as the complete typed list of products currently in the draft. Each line must contain the canonical productId, itemNumber, productName, and quantity. When the user adds a product, append or merge that product without removing existing lines. When the user edits or removes a product, update only the referenced line. Always return every current line on subsequent turns, including turns that only provide shipping or PO information. Never emit place_order unless orderLines accurately represents everything shown in the review.";
         instructionSet += " Completing or correcting order details is not submission authorization. After the final required detail is supplied, return intent=ReviewDraft with the complete entities and orderLines, no missing fields or clarification questions, readyForSubmission=true, and do not emit place_order. Keep the draft open so the user can review it, add products, or edit it. Emit intent=SubmitOrder and place_order only when the latest user turn explicitly confirms submission of the reviewed draft; infer that confirmation semantically rather than matching fixed phrases.";
+        instructionSet += " OVERRIDING PRODUCT API RULE: For product searches return intent=FindProduct, searchCategory (productName, itemNumber, or activeIngredient), and normalized searchQuery. Do not emit any product-search toolCall. The application calls the external HTTP API. If category is ambiguous, return searchCategory=null and ask for clarification. When executedToolResults exists, answer only from those API results.";
 
         var userPayload = new
         {
@@ -646,7 +649,7 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
         {
             var jsonObjectMessages = new object[] {
           new { role = "system", content = systemPrompt },
-          new { role = "system", content = instructionSet + " Return only a single valid JSON object with keys: status,intent,confidence,reply,searchQuery,searchSummary,entities,orderLines,missingFields,clarificationQuestions,toolCalls,grounding,escalate,escalationReason,unsupportedReason,readyForSubmission,policy." },
+          new { role = "system", content = instructionSet + " Return only a single valid JSON object with keys: status,intent,confidence,reply,searchQuery,searchCategory,searchSummary,entities,orderLines,missingFields,clarificationQuestions,toolCalls,grounding,escalate,escalationReason,unsupportedReason,readyForSubmission,policy." },
           new { role = "user", content = JsonSerializer.Serialize(userPayload, JsonOptions) }
         };
             var jsonObjectBody = new Dictionary<string, object?>
@@ -765,39 +768,32 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
       ? parsed
       : AssistantIntent.Unknown;
 
-    static bool IsProductSearchTool(string? name) => name is not null && (name.Equals("search_products_by_name", StringComparison.OrdinalIgnoreCase)
+    static bool IsLegacyProductSearchTool(string? name) => name is not null && (name.Equals("search_products", StringComparison.OrdinalIgnoreCase)
+      || name.Equals("search_products_by_name", StringComparison.OrdinalIgnoreCase)
       || name.Equals("search_products_by_item_number", StringComparison.OrdinalIgnoreCase)
       || name.Equals("search_products_by_active_ingredient", StringComparison.OrdinalIgnoreCase));
 
-    async Task<string?> InferProductSearchToolAsync(string message, string? searchQuery, CancellationToken ct)
+    static string? NormalizeSearchCategory(string? category) => category?.Replace(" ", string.Empty).ToLowerInvariant() switch
     {
-        var normalized = message.ToLowerInvariant();
-        if (normalized.Contains("item number") || normalized.Contains("item #") || normalized.Contains("sku") || normalized.Contains("product code")) return "search_products_by_item_number";
-        if (normalized.Contains("active ingredient") || normalized.Contains("ingredient") || normalized.Contains("contains")) return "search_products_by_active_ingredient";
-        if (normalized.Contains("product name") || normalized.Contains("named") || normalized.Contains("called")) return "search_products_by_name";
-        if (string.IsNullOrWhiteSpace(searchQuery)) return null;
+        "productname" => "productName", "itemnumber" or "sku" => "itemNumber",
+        "activeingredient" or "ingredient" => "activeIngredient", _ => null
+    };
 
-        var nameMatches = await productSearch.SearchByNameAsync(searchQuery, false, 1, ct);
-        var itemMatches = await productSearch.SearchByItemNumberAsync(searchQuery, false, 1, ct);
-        var ingredientMatches = await productSearch.SearchByActiveIngredientAsync(searchQuery, false, 1, ct);
-        var categoriesWithMatches = new[]
-        {
-            (Tool: "search_products_by_name", Count: nameMatches.TotalMatches),
-            (Tool: "search_products_by_item_number", Count: itemMatches.TotalMatches),
-            (Tool: "search_products_by_active_ingredient", Count: ingredientMatches.TotalMatches)
-        }.Where(result => result.Count > 0).ToList();
-        return categoriesWithMatches.Count == 1 ? categoriesWithMatches[0].Tool : null;
+    static string? SearchCategoryFromLegacyTool(string? name)
+    {
+        if (name?.Contains("ingredient", StringComparison.OrdinalIgnoreCase) == true) return "activeIngredient";
+        if (name?.Contains("item", StringComparison.OrdinalIgnoreCase) == true || name?.Contains("sku", StringComparison.OrdinalIgnoreCase) == true) return "itemNumber";
+        if (name?.Contains("name", StringComparison.OrdinalIgnoreCase) == true) return "productName";
+        return null;
     }
 
-    static string NormalizeProductSearchToolName(string? name, string? inferredTool)
+    static string? InferSearchCategoryFromMessage(string message)
     {
-        if (string.IsNullOrWhiteSpace(name)) return string.Empty;
-        if (IsProductSearchTool(name)) return name;
-        if (!name.StartsWith("search_products", StringComparison.OrdinalIgnoreCase)) return name;
-        if (name.Contains("ingredient", StringComparison.OrdinalIgnoreCase)) return "search_products_by_active_ingredient";
-        if (name.Contains("item", StringComparison.OrdinalIgnoreCase) || name.Contains("sku", StringComparison.OrdinalIgnoreCase)) return "search_products_by_item_number";
-        if (name.Contains("name", StringComparison.OrdinalIgnoreCase)) return "search_products_by_name";
-        return inferredTool ?? name;
+        var normalized = message.ToLowerInvariant();
+        if (normalized.Contains("item number") || normalized.Contains("item #") || normalized.Contains("sku") || normalized.Contains("product code")) return "itemNumber";
+        if (normalized.Contains("active ingredient") || normalized.Contains("ingredient") || normalized.Contains("contains")) return "activeIngredient";
+        if (normalized.Contains("product name") || normalized.Contains("named") || normalized.Contains("called")) return "productName";
+        return null;
     }
 
     static AssistantStatus ParseStatus(string? value) => Enum.TryParse<AssistantStatus>(value ?? string.Empty, true, out var parsed)
@@ -942,6 +938,7 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
             Confidence = GetDouble(root, "confidence"),
             Reply = GetString(root, "reply"),
             SearchQuery = GetNullableString(root, "searchQuery"),
+            SearchCategory = GetNullableString(root, "searchCategory"),
             SearchSummary = GetNullableString(root, "searchSummary"),
             Escalate = GetBool(root, "escalate"),
             EscalationReason = GetNullableString(root, "escalationReason"),
@@ -1657,6 +1654,7 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
         public double? Confidence { get; set; }
         public string? Reply { get; set; }
         public string? SearchQuery { get; set; }
+        public string? SearchCategory { get; set; }
         public string? SearchSummary { get; set; }
         public Dictionary<string, string?>? Entities { get; set; }
         public List<ModelOrderLine>? OrderLines { get; set; }
@@ -1727,7 +1725,7 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
             type = "object",
             additionalProperties = false,
             required = new[] {
-        "status","intent","confidence","reply","searchQuery","searchSummary","entities","orderLines","missingFields","clarificationQuestions","toolCalls","grounding","escalate","escalationReason","unsupportedReason","readyForSubmission","policy"
+        "status","intent","confidence","reply","searchQuery","searchCategory","searchSummary","entities","orderLines","missingFields","clarificationQuestions","toolCalls","grounding","escalate","escalationReason","unsupportedReason","readyForSubmission","policy"
       },
             properties = new
             {
@@ -1736,6 +1734,7 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
                 confidence = new { type = "number", minimum = 0, maximum = 1 },
                 reply = new { type = "string" },
                 searchQuery = new { type = new[] { "string", "null" } },
+                searchCategory = new { type = new[] { "string", "null" }, @enum = new object?[] { "productName", "itemNumber", "activeIngredient", null } },
                 searchSummary = new { type = new[] { "string", "null" }, maxLength = 220, description = "For grounded FindProduct only: one short sentence describing the interpreted search dimension and match count, without listing product details; otherwise null." },
                 entities = new
                 {
