@@ -4,6 +4,7 @@ using System.Text.Json.Serialization;
 var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddDbContext<AppDb>(o => o.UseSqlite(builder.Configuration.GetConnectionString("Cpp") ?? "Data Source=cpp-v3.db"));
 builder.Services.AddMemoryCache();
+builder.Services.AddScoped<IProductSearchService, ProductSearchService>();
 builder.Services.AddScoped<IOrderRuleService, OrderRuleService>(); builder.Services.AddSingleton<IFulfillmentGateway, MockJdeFulfillmentGateway>();
 builder.Services.AddHttpClient<IAssistantAgentService, AssistantAgentService>((sp, http) =>
 {

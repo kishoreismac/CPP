@@ -1717,6 +1717,27 @@ function Lines({
     </Table>
   );
 }
+function productSearchPath(criterion: string) {
+  if (criterion === "Product Name") return "/products/search-by-name";
+  if (criterion === "Item Number") return "/products/search-by-item-number";
+  if (criterion === "Active Ingredient")
+    return "/products/search-by-active-ingredient";
+  return `/products/search?criterion=${encodeURIComponent(criterion)}`;
+}
+
+function productSuggestionPath(criterion: string) {
+  if (criterion === "Product Name") return "/products/name-suggestions";
+  if (criterion === "Item Number")
+    return "/products/item-number-suggestions";
+  if (criterion === "Active Ingredient")
+    return "/products/active-ingredient-suggestions";
+  return `/products/suggestions?criterion=${encodeURIComponent(criterion)}`;
+}
+
+function appendQuery(path: string, query: string) {
+  return `${path}${path.includes("?") ? "&" : "?"}${query}`;
+}
+
 function ProductPicker({
   shipToAccountId,
   onClose,
@@ -1763,7 +1784,10 @@ function ProductPicker({
     queryKey: ["suggestions", criterion, suggestionQuery, shipToAccountId],
     queryFn: () =>
       api(
-        `/products/suggestions?criterion=${encodeURIComponent(criterion)}&query=${encodeURIComponent(suggestionQuery)}&shipToAccountId=${encodeURIComponent(shipToAccountId ?? "")}`,
+        appendQuery(
+          productSuggestionPath(criterion),
+          `query=${encodeURIComponent(suggestionQuery)}&shipToAccountId=${encodeURIComponent(shipToAccountId ?? "")}`,
+        ),
       ),
     enabled: suggestionQuery.length >= 2,
   });
@@ -1777,7 +1801,10 @@ function ProductPicker({
     queryKey: ["products", criterion, search, favorites],
     queryFn: () =>
       api(
-        `/products/search?criterion=${encodeURIComponent(criterion)}&query=${encodeURIComponent(search)}&shipToAccountId=${encodeURIComponent(shipToAccountId ?? "")}&favorites=${favorites}`,
+        appendQuery(
+          productSearchPath(criterion),
+          `query=${encodeURIComponent(search)}&shipToAccountId=${encodeURIComponent(shipToAccountId ?? "")}&favorites=${favorites}`,
+        ),
       ),
     enabled: search.length > 0,
   });
