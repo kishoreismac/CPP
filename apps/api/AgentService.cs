@@ -14,7 +14,7 @@ public interface IAssistantAgentService
     Task<AssistantHealthResponse> CheckHealthAsync(CancellationToken ct);
 }
 
-public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient httpClient, IOrderRuleService rules, IFulfillmentGateway fulfillment, IMemoryCache memory) : IAssistantAgentService
+public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient httpClient, ICppDataApiClient dataApi, IOrderRuleService rules, IFulfillmentGateway fulfillment, IMemoryCache memory) : IAssistantAgentService
 {
     static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
     {
@@ -50,7 +50,7 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
         };
         var inputHash = Hash(message);
         var version = GetVersionInfo();
-        var approvedTools = GetApprovedTools();
+        var approvedTools = GetAllowedApiOperations();
 
         if (!TryGetAgentApiConfig(out var apiConfig, out var apiConfigError))
         {
@@ -110,7 +110,9 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
             );
         }
 
-        var modelToolCalls = modelOutput.ToolCalls ?? [];
+        // The model classifies and extracts routing data only. It cannot execute operations.
+        // All API calls are synthesized and controlled by application orchestration below.
+        var modelToolCalls = new List<ModelToolCall>();
         var catalogSearchOrchestrated = false;
         if (!modelToolCalls.Any(t => string.Equals(t.Name, "search_products", StringComparison.OrdinalIgnoreCase))
             && modelOutput.Policy?.PromptInjectionDetected != true
@@ -133,7 +135,8 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
                     Reason = "Application-orchestrated catalog lookup from a database-matched fragment in the user's request.",
                     Arguments = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
                     {
-                        ["query"] = catalogFragment
+                        ["query"] = catalogFragment,
+                        ["criterion"] = "all"
                     }
                 });
                 catalogSearchOrchestrated = true;
@@ -149,7 +152,8 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
                 Reason = "Application-orchestrated catalog lookup from the model's structured FindProduct decision.",
                 Arguments = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
                 {
-                    ["query"] = modelOutput.SearchQuery?.Trim() ?? string.Empty
+                    ["query"] = modelOutput.SearchQuery?.Trim() ?? string.Empty,
+                    ["criterion"] = FirstNonEmpty(modelOutput.Entities ?? new Dictionary<string, string?>(), "searchCriterion", "searchField") ?? "all"
                 }
             });
         }
@@ -201,15 +205,6 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
             {
                 var followupOutput = await GetModelDecisionAsync(effectiveRequest, contextSnapshot, apiConfig, ct, executedToolResults);
                 followupOutput.SearchQuery ??= modelOutput.SearchQuery;
-                var followupToolCalls = followupOutput.ToolCalls ?? [];
-                modelToolCalls.AddRange(followupToolCalls);
-                acceptedToolCalls.AddRange(followupToolCalls
-                  .Where(t => string.Equals(t.Name, "place_order", StringComparison.OrdinalIgnoreCase)
-                    && approvedTools.Contains(t.Name, StringComparer.OrdinalIgnoreCase))
-                  .Select(t => new AssistantToolCall(
-                    t.Name,
-                    t.Reason ?? "Model-requested tool call after grounded lookup",
-                    new Dictionary<string, string?>(t.Arguments, StringComparer.OrdinalIgnoreCase))));
                 modelOutput = followupOutput;
                 if (catalogSearchOrchestrated && toolResults.Products.Count > 0)
                 {
@@ -450,7 +445,7 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
               null,
               []
             );
-            var approvedTools = GetApprovedTools();
+            var approvedTools = GetAllowedApiOperations();
             var contextSnapshot = await BuildContextSnapshotAsync(null, approvedTools, ct);
             _ = await GetModelDecisionAsync(probeRequest, contextSnapshot, apiConfig, ct);
 
@@ -519,50 +514,38 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
     {
         var accounts = new
         {
-            TotalCount = await db.Accounts.AsNoTracking().CountAsync(ct),
-            SearchTool = "get_accounts",
+            SearchRoute = config["DataApi:Routes:AccountSearch"] ?? "accounts/search?q={query}&limit={limit}",
             SearchableFields = new[] { "name", "accountNumber", "id" },
             ResultLimit = 10
         };
 
         var productCatalog = new
         {
-            TotalCount = await db.Products.AsNoTracking().CountAsync(ct),
-            SearchTool = "search_products",
+            SearchRoutes = new {
+                Name = config["DataApi:Routes:ProductByName"] ?? "products/by-name?q={query}",
+                ActiveIngredient = config["DataApi:Routes:ProductByActiveIngredient"] ?? "products/by-active-ingredient?q={query}",
+                ItemNumber = config["DataApi:Routes:ProductByItemNumber"] ?? "products/by-item-number?q={query}",
+                Generic = config["DataApi:Routes:ProductSearch"] ?? "products/search?criterion=all&q={query}"
+            },
             SearchableFields = new[] { "name", "itemNumber", "activeIngredient" },
-            ResultPageSize = 20
+            Source = "configured-data-api"
         };
 
-        var deliveryLocations = await db.DeliverToLocations
-          .AsNoTracking()
-          .OrderBy(x => x.ShipToAccountId)
-          .ThenByDescending(x => x.IsDefault)
-          .ThenBy(x => x.Name)
-          .Select(x => new { x.Id, x.ShipToAccountId, x.Name, x.City, x.IsDefault })
-          .ToListAsync(ct);
+        var deliveryLocations = new
+        {
+            Route = config["DataApi:Routes:DeliveryLocations"] ?? "accounts/{accountId}/deliver-to-locations",
+            RequiresCanonicalShipToAccountId = true
+        };
 
         object? order = null;
         if (!string.IsNullOrWhiteSpace(orderId))
         {
-            order = await db.Orders
-              .AsNoTracking()
-              .Where(x => x.Id == orderId)
-              .Select(x => new
-              {
-                  x.Id,
-                  Status = x.Status.ToString(),
-                  x.ShipToAccountId,
-                  x.CustomerPo,
-                  x.FreightOption,
-                  x.ContactEmail,
-                  LineCount = x.Lines.Count
-              })
-              .FirstOrDefaultAsync(ct);
+            order = await dataApi.GetOrderAsync(orderId, ct);
         }
 
         var snapshot = new
         {
-            approvedTools,
+            allowedApiOperations = approvedTools,
             accounts,
             productCatalog,
             deliveryLocations,
@@ -579,10 +562,11 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
         var maxTokens = config.GetValue<int?>("Agent:MaxTokens") ?? 1200;
 
         var systemPrompt = config["Agent:SystemPrompt"] ??
-          "You are a CPP ordering assistant. Interpret user intent from the entire conversation, including natural-language confirmations, corrections, and rejections. Always return valid JSON that matches the schema. Keep transaction control in application code. Never claim submission unless you emit place_order in the same response.";
+          "You are a CPP ordering assistant. Interpret user intent from the entire conversation and return valid JSON matching the schema. You classify intent and extract routing data only. Never call tools, functions, APIs, or databases; application code performs all allowed operations.";
         var instructionSet = config["Agent:InstructionSet"] ??
           "The catalog can be arbitrarily large. Always call search_products for product, SKU, availability, or active-ingredient questions. Never infer absence from contextSnapshot or claim not-found without an executed catalog search returning zero matches. When executedToolResults is present, answer only from those results and do not repeat lookup calls. Maintain structured order state across the conversation. Merge contextEntities with new facts and corrections, return the complete state every turn, and normalize canonical order entities against grounded results. Ask only for facts unresolved after the merge. Unit of measure comes from the catalog. Decide authorization semantically and emit place_order with the complete state when authorized.";
         instructionSet += " Treat generic catalog requests such as a product list, stock list, inventory list, available products, catalog, or any semantically equivalent wording as FindProduct searches. Treat terse text fragments and abbreviations as potential product-name, item-number, or active-ingredient searches before interpreting them as account or shipping values. In an ambiguous phrase such as an order request containing an unresolved fragment, search the catalog first; never invent an account from that fragment. For a generic request covering the whole catalog, set searchQuery to an empty string and call search_products with an empty query so the application returns the product list. For a request containing a product name, item number, active ingredient, category, or other identifying term, set searchQuery to only the most specific normalized catalog term inferred from the full conversation. Exclude conversational words such as find, show, list, stock, inventory, catalog, products, and items from a specific searchQuery. Never respond that a search is pending or that results will be provided later. When executedToolResults is present, retain searchQuery for traceability, do not request another lookup, and answer directly from the returned database results.";
+        instructionSet += " You only classify intent and extract structured routing data; you never execute tools, functions, database queries, or API calls. Always return toolCalls as an empty array. For FindProduct, set entities.searchCriterion to exactly productName, activeIngredient, itemNumber, or all. Use productName for names/families/prefixes, activeIngredient for chemical ingredient requests, itemNumber for SKU/item fragments, and all only for ambiguous or full-catalog searches. Application code selects and invokes the configured API route from intent, searchQuery, and searchCriterion.";
         instructionSet += " The account directory may contain hundreds of Ship-To accounts and contextSnapshot contains only account-search metadata. After a product and quantity are selected, if the Ship-To account is unresolved, ask the user which Ship-To account to use without listing the whole directory. When the user supplies an account name, number, ID, city-like fragment, abbreviation, or partial value, call get_accounts with only that normalized fragment. Present the grounded matching accounts for selection and never invent an account. Once a canonical Ship-To account is selected, continue to delivery-location selection for that account.";
         instructionSet += " For a grounded FindProduct response, populate searchSummary with exactly one short, natural sentence describing only the interpreted search dimension and grounded match count. Describe products whose names start with a prefix, products containing a canonical active ingredient, or products matching an item-number fragment. Never include individual product names, item numbers, packages, availability, or a numbered list in searchSummary because structured cards render those details. End the summary with a colon when matches exist. Set searchSummary to null for non-product-search intents.";
         instructionSet += " Maintain orderLines as the complete typed list of products currently in the draft. Each line must contain the canonical productId, itemNumber, productName, and quantity. When the user adds a product, append or merge that product without removing existing lines. When the user edits or removes a product, update only the referenced line. Always return every current line on subsequent turns, including turns that only provide shipping or PO information. Never emit place_order unless orderLines accurately represents everything shown in the review.";
@@ -712,28 +696,13 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
                 case "search_products":
                     {
                         var query = call.Arguments.TryGetValue("query", out var q) ? (q ?? string.Empty).Trim() : string.Empty;
-                        var productQuery = db.Products.AsNoTracking().AsQueryable();
-                        if (!string.IsNullOrWhiteSpace(query))
-                        {
-                            var pattern = $"%{EscapeLikePattern(query)}%";
-                            var normalizedQuery = string.Concat(query.Where(char.IsLetterOrDigit)).ToUpperInvariant();
-                            var normalizedPattern = $"%{EscapeLikePattern(normalizedQuery)}%";
-                            productQuery = productQuery.Where(p =>
-                              EF.Functions.Like(p.Name, pattern, "\\")
-                              || EF.Functions.Like(p.ItemNumber, pattern, "\\")
-                              || EF.Functions.Like(p.ActiveIngredients, pattern, "\\")
-                              || EF.Functions.Like(p.SearchTextNormalized, normalizedPattern, "\\"));
-                        }
-
-                        var totalMatches = await productQuery.CountAsync(ct);
-                        var data = await productQuery
-                          .OrderBy(p => p.Name)
-                          .ToListAsync(ct);
+                        var criterion = call.Arguments.GetValueOrDefault("criterion") ?? "all";
+                        var data = await dataApi.SearchProductsAsync(query, criterion, ct);
                         products.AddRange(data);
                         grounding.Add(new(
-                          "catalog-search",
-                          string.IsNullOrWhiteSpace(query) ? "all-products" : query,
-                          $"Database search matched {totalMatches} product(s); returned {data.Count}."
+                          "product-api",
+                          criterion,
+                          $"Configured product API route returned {data.Count} product(s) for '{query}'."
                         ));
                         foreach (var product in data)
                         {
@@ -744,20 +713,7 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
                 case "get_accounts":
                     {
                         var query = call.Arguments.TryGetValue("query", out var q) ? (q ?? string.Empty).Trim() : string.Empty;
-                        var accountQuery = db.Accounts.AsNoTracking().AsQueryable();
-                        if (!string.IsNullOrWhiteSpace(query))
-                        {
-                            var pattern = $"%{EscapeLikePattern(query)}%";
-                            accountQuery = accountQuery.Where(a =>
-                              EF.Functions.Like(a.Id, pattern, "\\")
-                              || EF.Functions.Like(a.Name, pattern, "\\")
-                              || EF.Functions.Like(a.AccountNumber, pattern, "\\")
-                              || EF.Functions.Like(a.City, pattern, "\\"));
-                        }
-                        var accounts = await accountQuery
-                          .OrderBy(a => a.Name)
-                          .Take(10)
-                          .ToListAsync(ct);
+                        var accounts = await dataApi.SearchAccountsAsync(query, 10, ct);
                         foreach (var account in accounts)
                         {
                             grounding.Add(new("account", account.Id, $"{account.Name} ({account.AccountNumber})"));
@@ -767,7 +723,7 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
                 case "get_order_summary":
                     {
                         if (!call.Arguments.TryGetValue("orderId", out var orderId) || string.IsNullOrWhiteSpace(orderId)) break;
-                        var order = await db.Orders.AsNoTracking().FirstOrDefaultAsync(o => o.Id == orderId, ct);
+                        var order = await dataApi.GetOrderAsync(orderId, ct);
                         if (order is not null)
                         {
                             grounding.Add(new("order", order.Id, $"Status {order.Status}; {order.Lines.Count} lines."));
@@ -777,8 +733,8 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
                 case "get_deliver_to_locations":
                     {
                         if (!call.Arguments.TryGetValue("shipToAccountId", out var shipTo) || string.IsNullOrWhiteSpace(shipTo)) break;
-                        var count = await db.DeliverToLocations.AsNoTracking().CountAsync(x => x.ShipToAccountId == shipTo, ct);
-                        grounding.Add(new("deliver-to", shipTo, $"{count} deliver-to locations available."));
+                        var locations = await dataApi.GetDeliveryLocationsAsync(shipTo, ct);
+                        grounding.Add(new("deliver-to-api", shipTo, $"Configured delivery-location API returned {locations.Count} location(s)."));
                         break;
                     }
             }
@@ -817,9 +773,11 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
         );
     }
 
-    IReadOnlyList<string> GetApprovedTools()
+    IReadOnlyList<string> GetAllowedApiOperations()
     {
-        return (config.GetSection("Agent:ApprovedTools").Get<string[]>() ?? [])
+        return (config.GetSection("Agent:AllowedApiOperations").Get<string[]>()
+          ?? config.GetSection("Agent:ApprovedTools").Get<string[]>()
+          ?? [])
           .Where(x => !string.IsNullOrWhiteSpace(x))
           .Select(x => x.Trim())
           .Distinct(StringComparer.OrdinalIgnoreCase)
@@ -1219,38 +1177,8 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
                 );
             }
 
-            var order = new Order
-            {
-                ShipToAccountId = request.ShipToAccountId,
-                DeliverToAccountId = request.DeliverToAccountId,
-                DeliverToAnotherLocation = request.DeliverToAnotherLocation,
-                AlternateDelivery = request.AlternateDelivery,
-                CustomerPo = request.CustomerPo,
-                ContactEmail = request.ContactEmail,
-                ShippingInstructions = request.ShippingInstructions,
-                CustomerPickup = request.CustomerPickup,
-                FreightOption = request.FreightOption,
-                RequestedArrivalDate = request.RequestedArrivalDate,
-                Lines = request.Lines,
-                SoldToName = account.SoldToName,
-                UpdatedAt = DateTime.UtcNow,
-                Status = OrderState.Draft
-            };
-
-            db.Orders.Add(order);
-            db.AuditEvents.Add(new AuditEvent { OrderId = order.Id, EventType = "AssistantDraftCreated", Detail = "Draft created by agent" });
-            await db.SaveChangesAsync(ct);
-
-            order.Status = OrderState.Submitting;
-            await db.SaveChangesAsync(ct);
-
-            var submission = await fulfillment.SubmitOrderAsync(order, ct);
-            order.Status = OrderState.Submitted;
-            order.WebOrderNumber = submission.WebOrderNumber;
-            order.SubmittedAt = DateTime.UtcNow;
-            order.FulfillmentOrdersJson = JsonSerializer.Serialize(submission.FulfillmentOrderNumbers);
-            db.AuditEvents.Add(new AuditEvent { OrderId = order.Id, EventType = "AssistantSubmissionSucceeded", Detail = submission.WebOrderNumber });
-            await db.SaveChangesAsync(ct);
+            var order = await dataApi.CreateOrderAsync(request, ct);
+            var submission = await dataApi.SubmitOrderAsync(order.Id, ct);
 
             var submissionGrounding = new List<AssistantGrounding>
             {
@@ -1396,18 +1324,19 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
         var accountId = FirstNonEmpty(entities, "shipToAccountId", "accountId");
         if (!string.IsNullOrWhiteSpace(accountId))
         {
-            var exact = await db.Accounts.AsNoTracking().FirstOrDefaultAsync(a => a.Id == accountId, ct);
+            var exact = await dataApi.GetAccountAsync(accountId, ct);
             if (exact is not null) return exact;
         }
 
         var accountName = FirstNonEmpty(entities, "shipToAccountName", "accountName", "account", "shipTo", "location", "city", "deliveryLocation");
         if (!string.IsNullOrWhiteSpace(accountName))
         {
-            var normalized = accountName.Trim();
-            var pattern = $"%{EscapeLikePattern(normalized)}%";
-            return await db.Accounts.AsNoTracking()
-              .OrderBy(a => a.Name)
-              .FirstOrDefaultAsync(a => EF.Functions.Like(a.Name, pattern, "\\") || EF.Functions.Like(a.Id, pattern, "\\"), ct);
+            var matches = await dataApi.SearchAccountsAsync(accountName.Trim(), 10, ct);
+            return matches.FirstOrDefault(a =>
+              a.Id.Equals(accountName, StringComparison.OrdinalIgnoreCase)
+              || a.Name.Equals(accountName, StringComparison.OrdinalIgnoreCase)
+              || a.AccountNumber.Equals(accountName, StringComparison.OrdinalIgnoreCase))
+              ?? (matches.Count == 1 ? matches[0] : null);
         }
 
         return null;
@@ -1418,24 +1347,24 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
         var productId = FirstNonEmpty(entities, "productId");
         if (!string.IsNullOrWhiteSpace(productId))
         {
-            var exact = await db.Products.AsNoTracking().FirstOrDefaultAsync(p => p.Id == productId, ct);
+            var exact = await dataApi.GetProductAsync(productId, ct);
             if (exact is not null) return exact;
         }
 
         var itemNumber = FirstNonEmpty(entities, "itemNumber", "sku");
         if (!string.IsNullOrWhiteSpace(itemNumber))
         {
-            var byItem = await db.Products.AsNoTracking().FirstOrDefaultAsync(p => p.ItemNumber == itemNumber, ct);
+            var byItem = (await dataApi.SearchProductsAsync(itemNumber, "itemNumber", ct))
+              .FirstOrDefault(p => p.ItemNumber.Equals(itemNumber, StringComparison.OrdinalIgnoreCase));
             if (byItem is not null) return byItem;
         }
 
         var productName = FirstNonEmpty(entities, "productName", "product");
         if (!string.IsNullOrWhiteSpace(productName))
         {
-            var pattern = $"%{EscapeLikePattern(productName.Trim())}%";
-            return await db.Products.AsNoTracking()
-              .OrderBy(p => p.Name)
-              .FirstOrDefaultAsync(p => EF.Functions.Like(p.Name, pattern, "\\"), ct);
+            var matches = await dataApi.SearchProductsAsync(productName.Trim(), "productName", ct);
+            return matches.FirstOrDefault(p => p.Name.Equals(productName, StringComparison.OrdinalIgnoreCase))
+              ?? (matches.Count == 1 ? matches[0] : null);
         }
 
         return null;
@@ -1468,11 +1397,8 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
 
         foreach (var candidate in candidates)
         {
-            var normalized = string.Concat(candidate.Where(char.IsLetterOrDigit)).ToUpperInvariant();
-            var normalizedPattern = $"%{EscapeLikePattern(normalized)}%";
-            if (await db.Products.AsNoTracking().AnyAsync(
-              product => EF.Functions.Like(product.SearchTextNormalized, normalizedPattern, "\\"),
-              ct))
+            var matches = await dataApi.SearchProductsAsync(candidate, "all", ct);
+            if (matches.Count > 0)
             {
                 return candidate;
             }
@@ -1483,29 +1409,22 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
 
     async Task<DeliverToLocation?> ResolveDeliverToAsync(string shipToAccountId, IReadOnlyDictionary<string, string?> entities, CancellationToken ct)
     {
+        var locations = await dataApi.GetDeliveryLocationsAsync(shipToAccountId, ct);
         var deliverToId = FirstNonEmpty(entities, "deliverToAccountId", "deliverToId");
         if (!string.IsNullOrWhiteSpace(deliverToId))
         {
-            var exact = await db.DeliverToLocations.AsNoTracking().FirstOrDefaultAsync(d => d.Id == deliverToId && d.ShipToAccountId == shipToAccountId, ct);
+            var exact = locations.FirstOrDefault(d => d.Id.Equals(deliverToId, StringComparison.OrdinalIgnoreCase));
             if (exact is not null) return exact;
         }
 
         var deliverToName = FirstNonEmpty(entities, "deliverToName", "deliveryLocation", "deliverTo", "facility", "locationName");
         if (!string.IsNullOrWhiteSpace(deliverToName))
         {
-            var pattern = $"%{EscapeLikePattern(deliverToName.Trim())}%";
-            var byName = await db.DeliverToLocations.AsNoTracking()
-              .Where(d => d.ShipToAccountId == shipToAccountId)
-              .OrderBy(d => d.Name)
-              .FirstOrDefaultAsync(d => EF.Functions.Like(d.Name, pattern, "\\"), ct);
+            var byName = locations.FirstOrDefault(d => d.Name.Equals(deliverToName, StringComparison.OrdinalIgnoreCase));
             if (byName is not null) return byName;
         }
 
-        return await db.DeliverToLocations.AsNoTracking()
-          .Where(d => d.ShipToAccountId == shipToAccountId)
-          .OrderByDescending(d => d.IsDefault)
-          .ThenBy(d => d.Name)
-          .FirstOrDefaultAsync(ct);
+        return locations.OrderByDescending(d => d.IsDefault).ThenBy(d => d.Name).FirstOrDefault();
     }
 
     static int? ResolveQuantity(IReadOnlyDictionary<string, string?> entities)

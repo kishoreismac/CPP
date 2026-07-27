@@ -5,6 +5,19 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddDbContext<AppDb>(o => o.UseSqlite(builder.Configuration.GetConnectionString("Cpp") ?? "Data Source=cpp-v3.db"));
 builder.Services.AddMemoryCache();
 builder.Services.AddScoped<IOrderRuleService, OrderRuleService>(); builder.Services.AddSingleton<IFulfillmentGateway, MockJdeFulfillmentGateway>();
+builder.Services.AddHttpClient<ICppDataApiClient, CppDataApiClient>((sp, http) =>
+{
+    var cfg = sp.GetRequiredService<IConfiguration>();
+    var baseUrl = cfg["DataApi:BaseUrl"] ?? "http://localhost:5090/api/";
+    http.BaseAddress = new Uri(baseUrl.EndsWith('/') ? baseUrl : $"{baseUrl}/");
+    http.Timeout = TimeSpan.FromSeconds(cfg.GetValue<int?>("DataApi:TimeoutSeconds") ?? 30);
+    var headerName = cfg["DataApi:Authentication:HeaderName"];
+    var headerValue = cfg["DataApi:Authentication:HeaderValue"];
+    if (!string.IsNullOrWhiteSpace(headerName) && !string.IsNullOrWhiteSpace(headerValue))
+    {
+        http.DefaultRequestHeaders.TryAddWithoutValidation(headerName, headerValue);
+    }
+});
 builder.Services.AddHttpClient<IAssistantAgentService, AssistantAgentService>((sp, http) =>
 {
     var cfg = sp.GetRequiredService<IConfiguration>();
