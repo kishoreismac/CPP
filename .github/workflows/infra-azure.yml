@@ -122,6 +122,8 @@ jobs:
     name: 6. Azure validation (depends on PSRule)
     needs: psrule
     runs-on: ubuntu-latest
+    # Existing unprotected OIDC context used only for read-only preflight validation.
+    environment: azure-infra
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -147,6 +149,8 @@ jobs:
     name: 7. Azure what-if (depends on validation)
     needs: validate
     runs-on: ubuntu-latest
+    # Existing unprotected OIDC context used only for the non-deploying preview.
+    environment: azure-infra
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
