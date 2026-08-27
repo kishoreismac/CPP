@@ -25,20 +25,22 @@ concurrency:
 
 env:
   BICEP_ROOT: infra/bicep/application
-  DEPLOY_ENVIRONMENT: dev
   API_IMAGE_TAG: latest
   WEB_IMAGE_TAG: latest
   DEPLOY_LOCATION: centralindia
 
+# Every job has an explicit needs dependency. The pipeline is intentionally
+# serial: format -> build -> lint -> Checkov -> PSRule -> validate -> what-if
+# -> protected dev approval -> deployment.
 jobs:
-  validate-and-preview:
-    name: Validate and preview dev Bicep
+  format:
+    name: 1. Bicep format check (first task)
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Bicep format check
+      - name: Check Bicep formatting
         shell: bash
         run: |
           set -euo pipefail
@@ -52,19 +54,39 @@ jobs:
             fi
           done < <(find "$BICEP_ROOT" -type f \( -name '*.bicep' -o -name '*.bicepparam' \) -print)
 
-      - name: Bicep build
-        shell: bash
-        run: |
-          set -euo pipefail
-          az bicep build --file "$BICEP_ROOT/main.bicep" --stdout >/dev/null
-          while IFS= read -r file; do
-            az bicep build-params --file "$file" --stdout >/dev/null
-          done < <(find "$BICEP_ROOT/parameters" -type f -name '*.bicepparam' -print)
+  build:
+    name: 2. Bicep build (depends on format)
+    needs: format
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
 
-      - name: Bicep lint
+      - name: Build Bicep and dev parameters
+        run: |
+          az bicep build --file "$BICEP_ROOT/main.bicep" --stdout >/dev/null
+          az bicep build-params --file "$BICEP_ROOT/parameters/dev.bicepparam" --stdout >/dev/null
+
+  lint:
+    name: 3. Bicep lint (depends on build)
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Lint Bicep
         run: az bicep lint --file "$BICEP_ROOT/main.bicep"
 
-      - name: Checkov security scan
+  checkov:
+    name: 4. Checkov (depends on lint)
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Run Checkov security scan
         uses: bridgecrewio/checkov-action@v12
         with:
           directory: infra/bicep/application
@@ -81,12 +103,28 @@ jobs:
           sarif_file: checkov-results.sarif
           category: checkov-bicep
 
-      - name: PSRule for Azure
+  psrule:
+    name: 5. PSRule for Azure (depends on Checkov)
+    needs: checkov
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Run PSRule for Azure with dev policy
         uses: microsoft/ps-rule@v2.9.0
         with:
           modules: PSRule.Rules.Azure
           inputPath: infra/bicep/application/parameters/dev.bicepparam
           option: infra/bicep/application/ps-rule.yaml
+
+  validate:
+    name: 6. Azure validation (depends on PSRule)
+    needs: psrule
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
 
       - name: Authenticate to Azure with OIDC
         uses: azure/login@v2
@@ -95,7 +133,7 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Azure provider validation
+      - name: Validate dev deployment with Azure
         run: |
           az deployment sub validate \
             --name "cpp-app-dev-${GITHUB_RUN_NUMBER}-validate" \
@@ -105,7 +143,22 @@ jobs:
             --parameters apiImageTag="$API_IMAGE_TAG" webImageTag="$WEB_IMAGE_TAG" \
             --output none
 
-      - name: Azure what-if
+  what-if:
+    name: 7. Azure what-if (depends on validation)
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Azure with OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Preview dev resource changes
         shell: bash
         run: |
           set -o pipefail
@@ -124,16 +177,16 @@ jobs:
           path: bicep-what-if.txt
           retention-days: 14
 
-      - name: Preview summary
+      - name: What-if review summary
         run: |
-          echo "### Dev Bicep preview completed" >> "$GITHUB_STEP_SUMMARY"
-          echo "Review the **Azure what-if** step or the uploaded what-if artifact." >> "$GITHUB_STEP_SUMMARY"
-          echo "The deployment job will wait for approval from a required reviewer of the **dev** environment." >> "$GITHUB_STEP_SUMMARY"
+          echo "### Dev Bicep what-if completed" >> "$GITHUB_STEP_SUMMARY"
+          echo "Review the what-if log or downloaded artifact before approving deployment." >> "$GITHUB_STEP_SUMMARY"
+          echo "The next job depends on this job and waits for a required reviewer of the **dev** environment." >> "$GITHUB_STEP_SUMMARY"
 
   deploy:
-    name: Approve and deploy dev Bicep
+    name: 8. Deploy dev (depends on what-if and reviewer approval)
     if: github.event_name == 'push'
-    needs: validate-and-preview
+    needs: what-if
     runs-on: ubuntu-latest
     environment:
       name: dev
@@ -148,7 +201,7 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Deploy Bicep infrastructure
+      - name: Deploy approved dev Bicep infrastructure
         id: deployment
         run: |
           az deployment sub create \

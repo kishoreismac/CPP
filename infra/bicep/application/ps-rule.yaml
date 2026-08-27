@@ -8,6 +8,21 @@ include:
 configuration:
   AZURE_PARAMETER_FILE_EXPANSION: true
 
+# Accepted deviations for the low-cost dev environment. Production-grade
+# environments should evaluate these rules without this exclusion list.
+rule:
+  exclude:
+    - Azure.ACR.GeoReplica
+    - Azure.ACR.MinSku
+    - Azure.ACR.ExportPolicy
+    - Azure.Log.Replication
+    - Azure.AppInsights.LocalAuth
+    - Azure.AppService.PlanInstanceCount
+    - Azure.AppService.AvailabilityZone
+    - Azure.AppService.MinPlan
+    - Azure.AppService.HTTP2
+    - Azure.AppService.ARRAffinity
+
 input:
   pathIgnore:
     - '**'
