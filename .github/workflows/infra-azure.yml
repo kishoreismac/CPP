@@ -187,13 +187,23 @@ jobs:
           echo "Review the what-if log or downloaded artifact before approving deployment." >> "$GITHUB_STEP_SUMMARY"
           echo "The next job depends on this job and waits for a required reviewer of the **dev** environment." >> "$GITHUB_STEP_SUMMARY"
 
-  deploy:
-    name: 8. Deploy dev (depends on what-if and reviewer approval)
+  approve-dev:
+    name: 8. Approve dev deployment (depends on what-if)
     if: github.event_name == 'push'
     needs: what-if
     runs-on: ubuntu-latest
     environment:
       name: dev
+    steps:
+      - name: Record reviewer approval
+        run: echo "The protected dev environment deployment was approved."
+
+  deploy:
+    name: 9. Deploy dev (depends on dev approval)
+    needs: approve-dev
+    runs-on: ubuntu-latest
+    # Reuse the established Azure OIDC subject only after protected dev approval.
+    environment: azure-infra
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
