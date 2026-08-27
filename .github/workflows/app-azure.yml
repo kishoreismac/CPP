@@ -97,7 +97,7 @@ jobs:
             --query "[?tags.application=='CPP Order Management Portal' && tags.environment=='${DEPLOY_ENVIRONMENT}'].name | [0]" \
             --output tsv)"
           if [[ -z "$resource_group" ]]; then
-            echo "No Terraform-managed CPP resource group was found for ${DEPLOY_ENVIRONMENT}." >&2
+            echo "No Bicep-managed CPP resource group was found for ${DEPLOY_ENVIRONMENT}." >&2
             exit 1
           fi
 

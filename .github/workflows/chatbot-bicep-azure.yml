@@ -83,7 +83,7 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Resolve existing Terraform resources
+      - name: Resolve existing application Bicep resources
         id: existing
         uses: azure/CLI@v2
         with:
@@ -94,7 +94,7 @@ jobs:
               --query "[?tags.application=='CPP Order Management Portal' && tags.environment=='${DEPLOY_ENVIRONMENT}'].name | [0]" \
               --output tsv)"
             if [[ -z "$resource_group" ]]; then
-              echo "No Terraform-managed CPP resource group was found for ${DEPLOY_ENVIRONMENT}." >&2
+              echo "No application Bicep resource group was found for ${DEPLOY_ENVIRONMENT}." >&2
               exit 1
             fi
 

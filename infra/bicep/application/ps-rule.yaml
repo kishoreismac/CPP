@@ -1,0 +1,14 @@
+requires:
+  PSRule.Rules.Azure: '>=1.34.0'
+
+include:
+  module:
+    - PSRule.Rules.Azure
+
+configuration:
+  AZURE_PARAMETER_FILE_EXPANSION: true
+
+input:
+  pathIgnore:
+    - '**'
+    - '!parameters/*.bicepparam'

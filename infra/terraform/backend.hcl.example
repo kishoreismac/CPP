@@ -1,5 +1,0 @@
-resource_group_name  = "rg-terraform-state"
-storage_account_name = "stterraformstateunique"
-container_name       = "tfstate"
-key                  = "cpp-order/dev.tfstate"
-use_azuread_auth     = true
