@@ -775,8 +775,10 @@ public class AssistantAgentService(AppDb db, IConfiguration config, HttpClient h
 
     static string? NormalizeSearchCategory(string? category) => category?.Replace(" ", string.Empty).ToLowerInvariant() switch
     {
-        "productname" => "productName", "itemnumber" or "sku" => "itemNumber",
-        "activeingredient" or "ingredient" => "activeIngredient", _ => null
+        "productname" => "productName",
+        "itemnumber" or "sku" => "itemNumber",
+        "activeingredient" or "ingredient" => "activeIngredient",
+        _ => null
     };
 
     static string? SearchCategoryFromLegacyTool(string? name)

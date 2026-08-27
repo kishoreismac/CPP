@@ -48,10 +48,14 @@ public sealed class ProductSearchService(AppDb db) : IProductSearchService
 
     public static ProductSearchCategory ParseCategory(string? value) => value?.Replace(" ", string.Empty).Replace("/", string.Empty).ToLowerInvariant() switch
     {
-        "itemnumber" => ProductSearchCategory.ItemNumber, "activeingredient" => ProductSearchCategory.ActiveIngredient,
-        "productcategory" => ProductSearchCategory.ProductCategory, "gtin" => ProductSearchCategory.Gtin,
-        "packagesize" => ProductSearchCategory.PackageSize, "vendorsupplier" or "supplier" => ProductSearchCategory.Supplier,
-        "productline" => ProductSearchCategory.ProductLine, _ => ProductSearchCategory.ProductName
+        "itemnumber" => ProductSearchCategory.ItemNumber,
+        "activeingredient" => ProductSearchCategory.ActiveIngredient,
+        "productcategory" => ProductSearchCategory.ProductCategory,
+        "gtin" => ProductSearchCategory.Gtin,
+        "packagesize" => ProductSearchCategory.PackageSize,
+        "vendorsupplier" or "supplier" => ProductSearchCategory.Supplier,
+        "productline" => ProductSearchCategory.ProductLine,
+        _ => ProductSearchCategory.ProductName
     };
     public static string Normalize(string value) => string.Join(' ', value.Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries));
     static string SearchToken(string value) => string.Concat(value.Where(char.IsLetterOrDigit)).ToUpperInvariant();
