@@ -7,7 +7,9 @@ on:
       - "infra/bicep/application/**"
       - ".github/workflows/infra-azure.yml"
   push:
-    branches: [main]
+    branches:
+      - main
+      - 'feature/**'
     paths:
       - "infra/bicep/application/**"
       - ".github/workflows/infra-azure.yml"
