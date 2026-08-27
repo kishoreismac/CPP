@@ -1727,8 +1727,7 @@ function productSearchPath(criterion: string) {
 
 function productSuggestionPath(criterion: string) {
   if (criterion === "Product Name") return "/products/name-suggestions";
-  if (criterion === "Item Number")
-    return "/products/item-number-suggestions";
+  if (criterion === "Item Number") return "/products/item-number-suggestions";
   if (criterion === "Active Ingredient")
     return "/products/active-ingredient-suggestions";
   return `/products/suggestions?criterion=${encodeURIComponent(criterion)}`;

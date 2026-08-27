@@ -76,7 +76,10 @@ jobs:
           trap 'rm -f "$formatted_file"' EXIT
           while IFS= read -r file; do
             az bicep format --file "$file" --stdout > "$formatted_file"
-            diff --unified "$file" "$formatted_file"
+            if [[ "$(cat "$file")" != "$(cat "$formatted_file")" ]]; then
+              diff --unified "$file" "$formatted_file" || true
+              exit 1
+            fi
           done < <(find "$BICEP_ROOT" -type f \( -name '*.bicep' -o -name '*.bicepparam' \) -print)
 
       - name: Bicep build
@@ -102,7 +105,7 @@ jobs:
           output_file_path: console,checkov-results.sarif
 
       - name: Upload Checkov SARIF
-        if: success() || failure()
+        if: always() && hashFiles('checkov-results.sarif') != ''
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: checkov-results.sarif
