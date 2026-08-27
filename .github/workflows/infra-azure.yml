@@ -13,34 +13,6 @@ on:
     paths:
       - "infra/bicep/application/**"
       - ".github/workflows/infra-azure.yml"
-  workflow_dispatch:
-    inputs:
-      action:
-        description: Bicep action
-        required: true
-        default: what-if
-        type: choice
-        options: [validate, what-if, deploy, destroy]
-      environment:
-        description: Deployment environment
-        required: true
-        default: dev
-        type: choice
-        options: [dev, test, qa, prod]
-      api_image_tag:
-        description: API container image tag
-        required: true
-        default: latest
-        type: string
-      web_image_tag:
-        description: Web container image tag
-        required: true
-        default: latest
-        type: string
-      confirm_destroy:
-        description: Type DESTROY to authorize resource-group deletion
-        required: false
-        type: string
 
 permissions:
   contents: read
@@ -48,22 +20,20 @@ permissions:
   security-events: write
 
 concurrency:
-  group: azure-infra-${{ inputs.environment || 'dev' }}
-  cancel-in-progress: false
+  group: azure-infra-dev-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   BICEP_ROOT: infra/bicep/application
-  DEPLOY_ENVIRONMENT: ${{ inputs.environment || 'dev' }}
-  API_IMAGE_TAG: ${{ inputs.api_image_tag || 'latest' }}
-  WEB_IMAGE_TAG: ${{ inputs.web_image_tag || 'latest' }}
-  DEPLOY_ACTION: ${{ inputs.action || 'validate' }}
+  DEPLOY_ENVIRONMENT: dev
+  API_IMAGE_TAG: latest
+  WEB_IMAGE_TAG: latest
   DEPLOY_LOCATION: centralindia
 
 jobs:
-  test-and-deploy:
-    name: Test and deploy Bicep
+  validate-and-preview:
+    name: Validate and preview dev Bicep
     runs-on: ubuntu-latest
-    environment: azure-infra
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -115,7 +85,7 @@ jobs:
         uses: microsoft/ps-rule@v2.9.0
         with:
           modules: PSRule.Rules.Azure
-          inputPath: infra/bicep/application/parameters/*.bicepparam
+          inputPath: infra/bicep/application/parameters/dev.bicepparam
           option: infra/bicep/application/ps-rule.yaml
 
       - name: Authenticate to Azure with OIDC
@@ -125,63 +95,76 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Reject unauthorized destroy
-        if: env.DEPLOY_ACTION == 'destroy' && inputs.confirm_destroy != 'DESTROY'
-        run: |
-          echo "Destroy requires confirm_destroy=DESTROY" >&2
-          exit 1
-
       - name: Azure provider validation
-        if: env.DEPLOY_ACTION != 'destroy'
         run: |
           az deployment sub validate \
-            --name "cpp-app-${DEPLOY_ENVIRONMENT}-${GITHUB_RUN_NUMBER}-validate" \
+            --name "cpp-app-dev-${GITHUB_RUN_NUMBER}-validate" \
             --location "$DEPLOY_LOCATION" \
             --template-file "$BICEP_ROOT/main.bicep" \
-            --parameters "$BICEP_ROOT/parameters/${DEPLOY_ENVIRONMENT}.bicepparam" \
+            --parameters "$BICEP_ROOT/parameters/dev.bicepparam" \
             --parameters apiImageTag="$API_IMAGE_TAG" webImageTag="$WEB_IMAGE_TAG" \
             --output none
 
       - name: Azure what-if
-        if: env.DEPLOY_ACTION == 'what-if' || env.DEPLOY_ACTION == 'deploy'
+        shell: bash
         run: |
+          set -o pipefail
           az deployment sub what-if \
-            --name "cpp-app-${DEPLOY_ENVIRONMENT}-${GITHUB_RUN_NUMBER}-whatif" \
+            --name "cpp-app-dev-${GITHUB_RUN_NUMBER}-whatif" \
             --location "$DEPLOY_LOCATION" \
             --template-file "$BICEP_ROOT/main.bicep" \
-            --parameters "$BICEP_ROOT/parameters/${DEPLOY_ENVIRONMENT}.bicepparam" \
+            --parameters "$BICEP_ROOT/parameters/dev.bicepparam" \
             --parameters apiImageTag="$API_IMAGE_TAG" webImageTag="$WEB_IMAGE_TAG" \
-            --result-format FullResourcePayloads
+            --result-format FullResourcePayloads | tee bicep-what-if.txt
+
+      - name: Upload what-if report
+        uses: actions/upload-artifact@v4
+        with:
+          name: bicep-what-if-dev-${{ github.run_number }}
+          path: bicep-what-if.txt
+          retention-days: 14
+
+      - name: Preview summary
+        run: |
+          echo "### Dev Bicep preview completed" >> "$GITHUB_STEP_SUMMARY"
+          echo "Review the **Azure what-if** step or the uploaded what-if artifact." >> "$GITHUB_STEP_SUMMARY"
+          echo "The deployment job will wait for approval from a required reviewer of the **dev** environment." >> "$GITHUB_STEP_SUMMARY"
+
+  deploy:
+    name: Approve and deploy dev Bicep
+    if: github.event_name == 'push'
+    needs: validate-and-preview
+    runs-on: ubuntu-latest
+    environment:
+      name: dev
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Azure with OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
       - name: Deploy Bicep infrastructure
         id: deployment
-        if: env.DEPLOY_ACTION == 'deploy'
         run: |
           az deployment sub create \
-            --name "cpp-app-${DEPLOY_ENVIRONMENT}-${GITHUB_RUN_NUMBER}" \
+            --name "cpp-app-dev-${GITHUB_RUN_NUMBER}" \
             --location "$DEPLOY_LOCATION" \
             --template-file "$BICEP_ROOT/main.bicep" \
-            --parameters "$BICEP_ROOT/parameters/${DEPLOY_ENVIRONMENT}.bicepparam" \
+            --parameters "$BICEP_ROOT/parameters/dev.bicepparam" \
             --parameters apiImageTag="$API_IMAGE_TAG" webImageTag="$WEB_IMAGE_TAG" \
             --output json > deployment.json
           echo "resource_group=$(jq -r '.properties.outputs.resourceGroupName.value' deployment.json)" >> "$GITHUB_OUTPUT"
           echo "api_url=$(jq -r '.properties.outputs.apiUrl.value' deployment.json)" >> "$GITHUB_OUTPUT"
           echo "web_url=$(jq -r '.properties.outputs.webUrl.value' deployment.json)" >> "$GITHUB_OUTPUT"
 
-      - name: Destroy Bicep infrastructure
-        if: env.DEPLOY_ACTION == 'destroy' && inputs.confirm_destroy == 'DESTROY'
-        run: |
-          resource_group="$(az group list --query "[?tags.application=='CPP Order Management Portal' && tags.environment=='${DEPLOY_ENVIRONMENT}' && tags.\"managed-by\"=='bicep'].name | [0]" --output tsv)"
-          if [[ -z "$resource_group" ]]; then
-            echo "No Bicep resource group exists for ${DEPLOY_ENVIRONMENT}; nothing to destroy."
-            exit 0
-          fi
-          az group delete --name "$resource_group" --yes
-
       - name: Deployment summary
-        if: env.DEPLOY_ACTION == 'deploy'
         run: |
-          echo "### Azure Bicep infrastructure" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Azure Bicep dev deployment" >> "$GITHUB_STEP_SUMMARY"
           echo "- Web: ${{ steps.deployment.outputs.web_url }}" >> "$GITHUB_STEP_SUMMARY"
           echo "- API: ${{ steps.deployment.outputs.api_url }}" >> "$GITHUB_STEP_SUMMARY"
           echo "- Resource group: ${{ steps.deployment.outputs.resource_group }}" >> "$GITHUB_STEP_SUMMARY"
