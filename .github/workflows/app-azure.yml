@@ -4,28 +4,17 @@ on:
   push:
     branches:
       - main
+      - 'feature/**'
     paths:
       - "apps/**"
       - ".github/workflows/app-azure.yml"
-  workflow_dispatch:
-    inputs:
-      environment:
-        description: Azure environment to deploy
-        required: true
-        default: dev
-        type: choice
-        options:
-          - dev
-          - test
-          - qa
-          - prod
 
 permissions:
   contents: read
   id-token: write
 
 concurrency:
-  group: app-deploy-${{ inputs.environment || 'dev' }}
+  group: app-deploy-dev-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -75,7 +64,9 @@ jobs:
     runs-on: ubuntu-latest
     environment: azure-infra
     env:
-      DEPLOY_ENVIRONMENT: ${{ inputs.environment || 'dev' }}
+      DEPLOY_ENVIRONMENT: dev
+      TARGET_RESOURCE_GROUP: rg-cpp-order-dev-oxtscl
+      CHATBOT_RESOURCE_GENERATION: bicep2
 
     steps:
       - name: Check out repository
@@ -93,13 +84,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          resource_group="$(az group list \
-            --query "[?tags.application=='CPP Order Management Portal' && tags.environment=='${DEPLOY_ENVIRONMENT}'].name | [0]" \
-            --output tsv)"
-          if [[ -z "$resource_group" ]]; then
-            echo "No Bicep-managed CPP resource group was found for ${DEPLOY_ENVIRONMENT}." >&2
-            exit 1
-          fi
+          resource_group="$TARGET_RESOURCE_GROUP"
+          az group show --name "$resource_group" --output none
 
           acr_name="$(az acr list --resource-group "$resource_group" --query '[0].name' --output tsv)"
           acr_server="$(az acr show --name "$acr_name" --query loginServer --output tsv)"
@@ -107,10 +93,25 @@ jobs:
           web_app="$(az webapp list --resource-group "$resource_group" --query "[?starts_with(name, 'web-')].name | [0]" --output tsv)"
           api_host="$(az webapp show --resource-group "$resource_group" --name "$api_app" --query defaultHostName --output tsv)"
           web_host="$(az webapp show --resource-group "$resource_group" --name "$web_app" --query defaultHostName --output tsv)"
+          api_principal_id="$(az webapp identity show --resource-group "$resource_group" --name "$api_app" --query principalId --output tsv)"
+          openai_account="$(az cognitiveservices account list --resource-group "$resource_group" \
+            --query "[?kind=='OpenAI' && tags.resourceGeneration=='${CHATBOT_RESOURCE_GENERATION}'].name | [0]" --output tsv)"
+          key_vault="$(az keyvault list --resource-group "$resource_group" \
+            --query "[?tags.resourceGeneration=='${CHATBOT_RESOURCE_GENERATION}'].name | [0]" --output tsv)"
 
-          for value in "$acr_name" "$acr_server" "$api_app" "$web_app" "$api_host" "$web_host"; do
+          for value in "$acr_name" "$acr_server" "$api_app" "$web_app" "$api_host" "$web_host" "$api_principal_id" "$openai_account" "$key_vault"; do
             if [[ -z "$value" ]]; then
-              echo "An expected Azure application resource could not be resolved." >&2
+              echo "An expected application or ${CHATBOT_RESOURCE_GENERATION} chatbot resource could not be resolved in ${resource_group}." >&2
+              exit 1
+            fi
+          done
+
+          openai_endpoint="$(az cognitiveservices account show --resource-group "$resource_group" \
+            --name "$openai_account" --query properties.endpoint --output tsv)"
+          secret_uri="https://${key_vault}.vault.azure.net/secrets/azure-openai-api-key"
+          for value in "$openai_endpoint" "$secret_uri"; do
+            if [[ -z "$value" ]]; then
+              echo "The new chatbot endpoint or Key Vault secret URI could not be resolved." >&2
               exit 1
             fi
           done
@@ -122,6 +123,10 @@ jobs:
           echo "web_app=$web_app" >> "$GITHUB_OUTPUT"
           echo "api_url=https://$api_host" >> "$GITHUB_OUTPUT"
           echo "web_url=https://$web_host" >> "$GITHUB_OUTPUT"
+          echo "openai_account=$openai_account" >> "$GITHUB_OUTPUT"
+          echo "key_vault=$key_vault" >> "$GITHUB_OUTPUT"
+          echo "openai_endpoint=$openai_endpoint" >> "$GITHUB_OUTPUT"
+          echo "secret_uri=$secret_uri" >> "$GITHUB_OUTPUT"
 
       - name: Build API image in ACR
         run: |
@@ -156,6 +161,32 @@ jobs:
             --container-image-name "${{ steps.azure.outputs.acr_server }}/cpp-web:${GITHUB_SHA}" \
             --container-registry-url "https://${{ steps.azure.outputs.acr_server }}" \
             --output none
+
+      - name: Configure API to use the new chatbot resources
+        shell: bash
+        run: |
+          set -euo pipefail
+          az webapp config appsettings set \
+            --resource-group "${{ steps.azure.outputs.resource_group }}" \
+            --name "${{ steps.azure.outputs.api_app }}" \
+            --settings \
+              "AGENT_ENDPOINT=${{ steps.azure.outputs.openai_endpoint }}" \
+              "AGENT_DEPLOYMENT=cpp-order-chat" \
+              "AGENT_APIVERSION=2024-10-21" \
+              'AGENT_API_KEY=@Microsoft.KeyVault(SecretUri=${{ steps.azure.outputs.secret_uri }})' \
+            --output none
+
+          configured_endpoint="$(az webapp config appsettings list \
+            --resource-group "${{ steps.azure.outputs.resource_group }}" \
+            --name "${{ steps.azure.outputs.api_app }}" \
+            --query "[?name=='AGENT_ENDPOINT'].value | [0]" --output tsv)"
+          if [[ "$configured_endpoint" != "${{ steps.azure.outputs.openai_endpoint }}" ]]; then
+            echo "The API chatbot endpoint setting was not applied correctly." >&2
+            exit 1
+          fi
+
+      - name: Restart deployed applications (depends on image and chatbot configuration)
+        run: |
           az webapp restart --resource-group "${{ steps.azure.outputs.resource_group }}" --name "${{ steps.azure.outputs.api_app }}"
           az webapp restart --resource-group "${{ steps.azure.outputs.resource_group }}" --name "${{ steps.azure.outputs.web_app }}"
 
@@ -179,3 +210,6 @@ jobs:
           echo "- Commit: \`${GITHUB_SHA}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- Web: ${{ steps.azure.outputs.web_url }}" >> "$GITHUB_STEP_SUMMARY"
           echo "- API: ${{ steps.azure.outputs.api_url }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Resource group: ${{ steps.azure.outputs.resource_group }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Azure OpenAI: ${{ steps.azure.outputs.openai_account }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Key Vault: ${{ steps.azure.outputs.key_vault }}" >> "$GITHUB_STEP_SUMMARY"
