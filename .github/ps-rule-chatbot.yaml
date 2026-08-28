@@ -8,6 +8,19 @@ include:
 configuration:
   AZURE_PARAMETER_FILE_EXPANSION: true
 
+# Accepted compatibility deviations for dev. The existing API uses a public
+# endpoint and an account key until private networking and Entra-only runtime
+# authentication are implemented. Soft delete is enabled by Azure and the
+# template explicitly sets its 90-day retention, but this PSRule version still
+# requires the retired enableSoftDelete property.
+rule:
+  exclude:
+    - Azure.AI.PublicAccess
+    - Azure.AI.DisableLocalAuth
+    - Azure.AI.PrivateEndpoints
+    - Azure.KeyVault.SoftDelete
+    - Azure.KeyVault.Firewall
+
 input:
   pathIgnore:
     - '**'

@@ -93,6 +93,7 @@ module diagnostics 'modules/diagnostics.bicep' = if (!empty(logAnalyticsWorkspac
   name: 'chatbot-diagnostics-${uniqueString(deployment().name)}'
   params: {
     cognitiveAccountName: ai.outputs.accountName
+    keyVaultName: deployKeyVault ? vault!.outputs.keyVaultName : ''
     logAnalyticsWorkspaceResourceId: logAnalyticsWorkspaceResourceId
   }
 }
