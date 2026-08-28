@@ -9,6 +9,8 @@ param publicNetworkAccess bool
 param tags object
 
 resource account 'Microsoft.CognitiveServices/accounts@2023-05-01' = {
+  //checkov:skip=CKV_AZURE_134:The existing API calls this public endpoint and has no private endpoint or VNet integration.
+  //checkov:skip=CKV_AZURE_236:The existing API authenticates with AGENT_API_KEY; disabling local authentication would break the runtime contract.
   name: accountName
   location: location
   kind: 'OpenAI'
