@@ -11,9 +11,11 @@ param modelDeploymentName = 'cpp-order-chat'
 param modelSkuName = 'GlobalStandard'
 param modelCapacity = 10
 
-// Populate from Terraform outputs/Azure after the app infrastructure exists.
+// The workflow replaces these values with resources resolved from Azure.
+// A valid placeholder workspace ID keeps conditional diagnostics visible to
+// static policy analysis; it is never used by workflow deployments.
 param apiPrincipalId = ''
-param logAnalyticsWorkspaceResourceId = ''
+param logAnalyticsWorkspaceResourceId = '/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/psrule-dev/providers/Microsoft.OperationalInsights/workspaces/psrule-dev'
 
 param deployKeyVault = true
 param publicNetworkAccess = true
