@@ -1,77 +1,227 @@
 name: Chatbot Bicep Infrastructure
 
 on:
-  push:
-    branches:
-      - agent/chatbot-bicep-infrastructure
+  pull_request:
+    branches: [main]
     paths:
       - "infra/bicep/chatbot/**"
+      - ".github/ps-rule-chatbot.yaml"
       - ".github/workflows/chatbot-bicep-azure.yml"
-  workflow_dispatch:
-    inputs:
-      environment:
-        description: Existing CPP Azure environment
-        required: true
-        default: dev
-        type: choice
-        options:
-          - dev
-          - test
-          - qa
-          - prod
-      location:
-        description: Azure OpenAI deployment region
-        required: true
-        default: eastus2
-        type: string
-      model_name:
-        description: Azure OpenAI model name
-        required: true
-        default: gpt-5.4-mini
-        type: string
-      model_version:
-        description: Azure OpenAI model version
-        required: true
-        default: "2026-03-17"
-        type: string
-      model_sku:
-        description: Azure OpenAI deployment SKU
-        required: true
-        default: GlobalStandard
-        type: choice
-        options:
-          - GlobalStandard
-          - Standard
-          - DataZoneStandard
-      model_capacity:
-        description: Deployment capacity in thousands of tokens per minute
-        required: true
-        default: "10"
-        type: string
+  push:
+    branches:
+      - main
+      - 'feature/**'
+    paths:
+      - "infra/bicep/chatbot/**"
+      - ".github/ps-rule-chatbot.yaml"
+      - ".github/workflows/chatbot-bicep-azure.yml"
 
 permissions:
   contents: read
   id-token: write
+  security-events: write
 
 concurrency:
-  group: chatbot-bicep-${{ inputs.environment || 'dev' }}
-  cancel-in-progress: false
+  group: chatbot-bicep-dev-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   BICEP_ROOT: infra/bicep/chatbot
-  DEPLOY_ENVIRONMENT: ${{ inputs.environment || 'dev' }}
-  AI_LOCATION: ${{ inputs.location || 'eastus2' }}
-  MODEL_NAME: ${{ inputs.model_name || 'gpt-5.4-mini' }}
-  MODEL_VERSION: ${{ inputs.model_version || '2026-03-17' }}
-  MODEL_SKU: ${{ inputs.model_sku || 'GlobalStandard' }}
-  MODEL_CAPACITY: ${{ inputs.model_capacity || '10' }}
+  DEPLOY_ENVIRONMENT: dev
+  AI_LOCATION: eastus2
+  MODEL_NAME: gpt-5.4-mini
+  MODEL_VERSION: '2026-03-17'
+  MODEL_SKU: GlobalStandard
+  MODEL_CAPACITY: '10'
 
+# Every job has an explicit needs dependency. The pipeline is intentionally
+# serial: format -> build -> lint -> Checkov -> PSRule -> resolve shared Azure
+# resources -> model/quota preflight -> validate -> what-if -> protected dev
+# approval -> deployment/configuration/verification.
 jobs:
-  deploy:
-    name: Validate and deploy chatbot infrastructure
+  format:
+    name: 1. Chatbot Bicep format check (first task)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Check chatbot Bicep formatting
+        shell: bash
+        run: |
+          set -euo pipefail
+          formatted_file="$(mktemp)"
+          trap 'rm -f "$formatted_file"' EXIT
+          while IFS= read -r file; do
+            az bicep format --file "$file" --stdout > "$formatted_file"
+            if [[ "$(cat "$file")" != "$(cat "$formatted_file")" ]]; then
+              diff --unified "$file" "$formatted_file" || true
+              exit 1
+            fi
+          done < <(find "$BICEP_ROOT" -type f \( -name '*.bicep' -o -name '*.bicepparam' \) -print)
+
+  build:
+    name: 2. Chatbot Bicep build (depends on format)
+    needs: format
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Build chatbot Bicep and dev parameters
+        run: |
+          az bicep build --file "$BICEP_ROOT/main.bicep" --stdout >/dev/null
+          az bicep build-params --file "$BICEP_ROOT/parameters/dev.bicepparam" --stdout >/dev/null
+
+  lint:
+    name: 3. Chatbot Bicep lint (depends on build)
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Lint chatbot Bicep
+        run: az bicep lint --file "$BICEP_ROOT/main.bicep"
+
+  checkov:
+    name: 4. Chatbot Checkov (depends on lint)
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Run chatbot Checkov security scan
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: infra/bicep/chatbot
+          framework: bicep
+          quiet: false
+          soft_fail: false
+          output_format: cli,sarif
+          output_file_path: console,chatbot-checkov-results.sarif
+
+      - name: Upload chatbot Checkov SARIF
+        if: always() && hashFiles('chatbot-checkov-results.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: chatbot-checkov-results.sarif
+          category: checkov-chatbot-bicep
+
+  psrule:
+    name: 5. Chatbot PSRule for Azure (depends on Checkov)
+    needs: checkov
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Run PSRule for Azure with chatbot dev policy
+        uses: microsoft/ps-rule@v2.9.0
+        with:
+          modules: PSRule.Rules.Azure
+          inputPath: infra/bicep/chatbot/parameters/dev.bicepparam
+          option: .github/ps-rule-chatbot.yaml
+
+  resolve:
+    name: 6. Resolve shared resources (depends on PSRule)
+    needs: psrule
     runs-on: ubuntu-latest
     environment: azure-infra
+    outputs:
+      resource_group: ${{ steps.existing.outputs.resource_group }}
+      api_app: ${{ steps.existing.outputs.api_app }}
+      api_principal_id: ${{ steps.existing.outputs.api_principal_id }}
+      workspace_id: ${{ steps.existing.outputs.workspace_id }}
+    steps:
+      - name: Authenticate to Azure with OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
+      - name: Resolve shared application Bicep resources
+        id: existing
+        shell: bash
+        run: |
+          set -euo pipefail
+          resource_group="$(az group list \
+            --query "[?tags.application=='CPP Order Management Portal' && tags.environment=='dev'].name | [0]" \
+            --output tsv)"
+          if [[ -z "$resource_group" ]]; then
+            echo "No CPP application resource group was found for dev." >&2
+            exit 1
+          fi
+
+          api_app="$(az webapp list --resource-group "$resource_group" \
+            --query "[?starts_with(name, 'api-')].name | [0]" --output tsv)"
+          api_principal_id="$(az webapp identity show --resource-group "$resource_group" \
+            --name "$api_app" --query principalId --output tsv)"
+          workspace_id="$(az monitor log-analytics workspace list --resource-group "$resource_group" \
+            --query '[0].id' --output tsv)"
+
+          for value in "$api_app" "$api_principal_id" "$workspace_id"; do
+            if [[ -z "$value" ]]; then
+              echo "An expected API identity or Log Analytics resource could not be resolved." >&2
+              exit 1
+            fi
+          done
+
+          echo "resource_group=$resource_group" >> "$GITHUB_OUTPUT"
+          echo "api_app=$api_app" >> "$GITHUB_OUTPUT"
+          echo "api_principal_id=$api_principal_id" >> "$GITHUB_OUTPUT"
+          echo "workspace_id=$workspace_id" >> "$GITHUB_OUTPUT"
+
+  model-preflight:
+    name: 7. Model and quota preflight (depends on resource resolution)
+    needs: resolve
+    runs-on: ubuntu-latest
+    environment: azure-infra
+    steps:
+      - name: Authenticate to Azure with OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Verify model availability and quota
+        shell: bash
+        run: |
+          set -euo pipefail
+          version_count="$(az cognitiveservices model list --location "$AI_LOCATION" \
+            --query "length([?model.name=='${MODEL_NAME}' && model.version=='${MODEL_VERSION}' && contains(model.skus[].name, '${MODEL_SKU}')])" \
+            --output tsv)"
+          if [[ "$version_count" == "0" ]]; then
+            echo "${MODEL_NAME} ${MODEL_VERSION} with SKU ${MODEL_SKU} is unavailable in ${AI_LOCATION}." >&2
+            exit 1
+          fi
+
+          quota_name="OpenAI.${MODEL_SKU}.${MODEL_NAME}"
+          quota_limit="$(az cognitiveservices usage list --location "$AI_LOCATION" \
+            --query "[?name.value=='${quota_name}'].limit | [0]" --output tsv)"
+          quota_used="$(az cognitiveservices usage list --location "$AI_LOCATION" \
+            --query "[?name.value=='${quota_name}'].currentValue | [0]" --output tsv)"
+          if [[ -z "$quota_limit" || -z "$quota_used" ]]; then
+            echo "No quota meter named ${quota_name} was found in ${AI_LOCATION}." >&2
+            exit 1
+          fi
+
+          available=$(( ${quota_limit%%.*} - ${quota_used%%.*} ))
+          if (( available < MODEL_CAPACITY )); then
+            echo "Insufficient ${quota_name} quota: requested ${MODEL_CAPACITY}, available ${available}." >&2
+            exit 1
+          fi
+
+  validate:
+    name: 8. Chatbot Azure validation (depends on model preflight)
+    needs:
+      - resolve
+      - model-preflight
+    runs-on: ubuntu-latest
+    environment: azure-infra
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -83,113 +233,86 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Resolve existing application Bicep resources
-        id: existing
-        uses: azure/CLI@v2
+      - name: Validate chatbot dev deployment with Azure
+        run: |
+          az deployment group validate \
+            --name "cpp-chatbot-dev-${GITHUB_RUN_NUMBER}-validate" \
+            --resource-group "${{ needs.resolve.outputs.resource_group }}" \
+            --template-file "$BICEP_ROOT/main.bicep" \
+            --parameters "$BICEP_ROOT/parameters/dev.bicepparam" \
+            --parameters apiPrincipalId="${{ needs.resolve.outputs.api_principal_id }}" logAnalyticsWorkspaceResourceId="${{ needs.resolve.outputs.workspace_id }}" \
+            --output none
+
+  what-if:
+    name: 9. Chatbot Azure what-if (depends on validation)
+    needs:
+      - resolve
+      - validate
+    runs-on: ubuntu-latest
+    environment: azure-infra
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Azure with OIDC
+        uses: azure/login@v2
         with:
-          inlineScript: |
-            set -euo pipefail
-
-            resource_group="$(az group list \
-              --query "[?tags.application=='CPP Order Management Portal' && tags.environment=='${DEPLOY_ENVIRONMENT}'].name | [0]" \
-              --output tsv)"
-            if [[ -z "$resource_group" ]]; then
-              echo "No application Bicep resource group was found for ${DEPLOY_ENVIRONMENT}." >&2
-              exit 1
-            fi
-
-            api_app="$(az webapp list --resource-group "$resource_group" \
-              --query "[?starts_with(name, 'api-')].name | [0]" --output tsv)"
-            api_principal_id="$(az webapp identity show --resource-group "$resource_group" \
-              --name "$api_app" --query principalId --output tsv)"
-            workspace_id="$(az monitor log-analytics workspace list --resource-group "$resource_group" \
-              --query '[0].id' --output tsv)"
-
-            for value in "$api_app" "$api_principal_id" "$workspace_id"; do
-              if [[ -z "$value" ]]; then
-                echo "An expected API identity or Log Analytics resource could not be resolved." >&2
-                exit 1
-              fi
-            done
-
-            echo "resource_group=$resource_group" >> "$GITHUB_OUTPUT"
-            echo "api_app=$api_app" >> "$GITHUB_OUTPUT"
-            echo "api_principal_id=$api_principal_id" >> "$GITHUB_OUTPUT"
-            echo "workspace_id=$workspace_id" >> "$GITHUB_OUTPUT"
-
-      - name: Verify model availability and quota
-        uses: azure/CLI@v2
-        with:
-          inlineScript: |
-            set -euo pipefail
-
-            version_count="$(az cognitiveservices model list --location "$AI_LOCATION" \
-              --query "length([?model.name=='${MODEL_NAME}' && model.version=='${MODEL_VERSION}' && contains(model.skus[].name, '${MODEL_SKU}')])" \
-              --output tsv)"
-            if [[ "$version_count" == "0" ]]; then
-              echo "${MODEL_NAME} ${MODEL_VERSION} with SKU ${MODEL_SKU} is unavailable in ${AI_LOCATION}." >&2
-              exit 1
-            fi
-
-            quota_name="OpenAI.${MODEL_SKU}.${MODEL_NAME}"
-            quota_limit="$(az cognitiveservices usage list --location "$AI_LOCATION" \
-              --query "[?name.value=='${quota_name}'].limit | [0]" --output tsv)"
-            quota_used="$(az cognitiveservices usage list --location "$AI_LOCATION" \
-              --query "[?name.value=='${quota_name}'].currentValue | [0]" --output tsv)"
-            if [[ -z "$quota_limit" || -z "$quota_used" ]]; then
-              echo "No quota meter named ${quota_name} was found in ${AI_LOCATION}." >&2
-              exit 1
-            fi
-
-            quota_limit_integer="${quota_limit%%.*}"
-            quota_used_integer="${quota_used%%.*}"
-            available=$((quota_limit_integer - quota_used_integer))
-            if (( available < MODEL_CAPACITY )); then
-              echo "Insufficient ${quota_name} quota: requested ${MODEL_CAPACITY}, available ${available}." >&2
-              exit 1
-            fi
-
-      - name: Validate Bicep deployment
-        uses: azure/bicep-deploy@v2
-        with:
-          type: deployment
-          operation: validate
-          name: cpp-chatbot-${{ env.DEPLOY_ENVIRONMENT }}-${{ github.run_number }}-validate
-          scope: resourceGroup
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-          resource-group-name: ${{ steps.existing.outputs.resource_group }}
-          template-file: ${{ env.BICEP_ROOT }}/main.bicep
-          validation-level: provider
-          parameters: |
-            environment: ${{ env.DEPLOY_ENVIRONMENT }}
-            location: ${{ env.AI_LOCATION }}
-            modelName: ${{ env.MODEL_NAME }}
-            modelVersion: ${{ env.MODEL_VERSION }}
-            modelSkuName: ${{ env.MODEL_SKU }}
-            modelCapacity: ${{ env.MODEL_CAPACITY }}
-            apiPrincipalId: ${{ steps.existing.outputs.api_principal_id }}
-            logAnalyticsWorkspaceResourceId: ${{ steps.existing.outputs.workspace_id }}
 
-      - name: Preview resource changes
-        uses: azure/bicep-deploy@v2
+      - name: Preview chatbot dev resource changes
+        shell: bash
+        run: |
+          set -o pipefail
+          az deployment group what-if \
+            --name "cpp-chatbot-dev-${GITHUB_RUN_NUMBER}-whatif" \
+            --resource-group "${{ needs.resolve.outputs.resource_group }}" \
+            --template-file "$BICEP_ROOT/main.bicep" \
+            --parameters "$BICEP_ROOT/parameters/dev.bicepparam" \
+            --parameters apiPrincipalId="${{ needs.resolve.outputs.api_principal_id }}" logAnalyticsWorkspaceResourceId="${{ needs.resolve.outputs.workspace_id }}" \
+            --result-format FullResourcePayloads | tee chatbot-bicep-what-if.txt
+
+      - name: Upload chatbot what-if report
+        uses: actions/upload-artifact@v4
         with:
-          type: deployment
-          operation: whatIf
-          name: cpp-chatbot-${{ env.DEPLOY_ENVIRONMENT }}-${{ github.run_number }}-whatif
-          scope: resourceGroup
+          name: chatbot-bicep-what-if-dev-${{ github.run_number }}
+          path: chatbot-bicep-what-if.txt
+          retention-days: 14
+
+      - name: Chatbot what-if review summary
+        run: |
+          echo "### Chatbot dev Bicep what-if completed" >> "$GITHUB_STEP_SUMMARY"
+          echo "Review the what-if log or downloaded artifact before approving deployment." >> "$GITHUB_STEP_SUMMARY"
+
+  approve-dev:
+    name: 10. Approve chatbot dev deployment (depends on what-if)
+    if: github.event_name == 'push'
+    needs: what-if
+    runs-on: ubuntu-latest
+    environment:
+      name: dev
+    steps:
+      - name: Record reviewer approval
+        run: echo "The protected dev chatbot deployment was approved."
+
+  deploy:
+    name: 11. Deploy chatbot dev (depends on dev approval)
+    needs:
+      - resolve
+      - approve-dev
+    runs-on: ubuntu-latest
+    environment: azure-infra
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Azure with OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-          resource-group-name: ${{ steps.existing.outputs.resource_group }}
-          template-file: ${{ env.BICEP_ROOT }}/main.bicep
-          validation-level: provider
-          parameters: |
-            environment: ${{ env.DEPLOY_ENVIRONMENT }}
-            location: ${{ env.AI_LOCATION }}
-            modelName: ${{ env.MODEL_NAME }}
-            modelVersion: ${{ env.MODEL_VERSION }}
-            modelSkuName: ${{ env.MODEL_SKU }}
-            modelCapacity: ${{ env.MODEL_CAPACITY }}
-            apiPrincipalId: ${{ steps.existing.outputs.api_principal_id }}
-            logAnalyticsWorkspaceResourceId: ${{ steps.existing.outputs.workspace_id }}
 
       - name: Deploy chatbot resources
         id: deployment
@@ -197,57 +320,53 @@ jobs:
         with:
           type: deployment
           operation: create
-          name: cpp-chatbot-${{ env.DEPLOY_ENVIRONMENT }}-${{ github.run_number }}
+          name: cpp-chatbot-dev-${{ github.run_number }}
           scope: resourceGroup
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-          resource-group-name: ${{ steps.existing.outputs.resource_group }}
+          resource-group-name: ${{ needs.resolve.outputs.resource_group }}
           template-file: ${{ env.BICEP_ROOT }}/main.bicep
           masked-outputs: agentApiKeyAppSettingValue
           parameters: |
-            environment: ${{ env.DEPLOY_ENVIRONMENT }}
+            environment: dev
             location: ${{ env.AI_LOCATION }}
             modelName: ${{ env.MODEL_NAME }}
             modelVersion: ${{ env.MODEL_VERSION }}
             modelSkuName: ${{ env.MODEL_SKU }}
             modelCapacity: ${{ env.MODEL_CAPACITY }}
-            apiPrincipalId: ${{ steps.existing.outputs.api_principal_id }}
-            logAnalyticsWorkspaceResourceId: ${{ steps.existing.outputs.workspace_id }}
+            apiPrincipalId: ${{ needs.resolve.outputs.api_principal_id }}
+            logAnalyticsWorkspaceResourceId: ${{ needs.resolve.outputs.workspace_id }}
 
-      - name: Configure existing API chatbot settings
-        uses: azure/CLI@v2
-        with:
-          inlineScript: |
-            az webapp config appsettings set \
-              --resource-group "${{ steps.existing.outputs.resource_group }}" \
-              --name "${{ steps.existing.outputs.api_app }}" \
-              --settings \
-                "AGENT_ENDPOINT=${{ steps.deployment.outputs.azureOpenAiEndpoint }}" \
-                "AGENT_DEPLOYMENT=${{ steps.deployment.outputs.agentDeploymentName }}" \
-                "AGENT_APIVERSION=${{ steps.deployment.outputs.agentApiVersion }}" \
-                'AGENT_API_KEY=${{ steps.deployment.outputs.agentApiKeyAppSettingValue }}' \
-              --output none
-
-      - name: Verify deployed resources
-        uses: azure/CLI@v2
-        with:
-          inlineScript: |
-            az cognitiveservices account show \
-              --resource-group "${{ steps.existing.outputs.resource_group }}" \
-              --name "${{ steps.deployment.outputs.azureOpenAiAccountName }}" \
-              --query "{name:name,state:properties.provisioningState,endpoint:properties.endpoint}" \
-              --output table
-            az cognitiveservices account deployment show \
-              --resource-group "${{ steps.existing.outputs.resource_group }}" \
-              --name "${{ steps.deployment.outputs.azureOpenAiAccountName }}" \
-              --deployment-name "${{ steps.deployment.outputs.agentDeploymentName }}" \
-              --query "{name:name,state:properties.provisioningState,model:properties.model.name,version:properties.model.version}" \
-              --output table
-
-      - name: Publish deployment summary
+      - name: Configure API chatbot settings
+        shell: bash
         run: |
-          echo "### Chatbot Bicep deployment" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Environment: ${DEPLOY_ENVIRONMENT}" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Resource group: ${{ steps.existing.outputs.resource_group }}" >> "$GITHUB_STEP_SUMMARY"
+          az webapp config appsettings set \
+            --resource-group "${{ needs.resolve.outputs.resource_group }}" \
+            --name "${{ needs.resolve.outputs.api_app }}" \
+            --settings \
+              "AGENT_ENDPOINT=${{ steps.deployment.outputs.azureOpenAiEndpoint }}" \
+              "AGENT_DEPLOYMENT=${{ steps.deployment.outputs.agentDeploymentName }}" \
+              "AGENT_APIVERSION=${{ steps.deployment.outputs.agentApiVersion }}" \
+              'AGENT_API_KEY=${{ steps.deployment.outputs.agentApiKeyAppSettingValue }}' \
+            --output none
+
+      - name: Verify deployed chatbot resources
+        run: |
+          az cognitiveservices account show \
+            --resource-group "${{ needs.resolve.outputs.resource_group }}" \
+            --name "${{ steps.deployment.outputs.azureOpenAiAccountName }}" \
+            --query "{name:name,state:properties.provisioningState,endpoint:properties.endpoint}" \
+            --output table
+          az cognitiveservices account deployment show \
+            --resource-group "${{ needs.resolve.outputs.resource_group }}" \
+            --name "${{ steps.deployment.outputs.azureOpenAiAccountName }}" \
+            --deployment-name "${{ steps.deployment.outputs.agentDeploymentName }}" \
+            --query "{name:name,state:properties.provisioningState,model:properties.model.name,version:properties.model.version}" \
+            --output table
+
+      - name: Publish chatbot deployment summary
+        run: |
+          echo "### Chatbot Bicep dev deployment" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Resource group: ${{ needs.resolve.outputs.resource_group }}" >> "$GITHUB_STEP_SUMMARY"
           echo "- Azure OpenAI account: ${{ steps.deployment.outputs.azureOpenAiAccountName }}" >> "$GITHUB_STEP_SUMMARY"
           echo "- Model: ${MODEL_NAME} ${MODEL_VERSION} (${MODEL_SKU}, capacity ${MODEL_CAPACITY})" >> "$GITHUB_STEP_SUMMARY"
-          echo "- API App Service: ${{ steps.existing.outputs.api_app }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- API App Service: ${{ needs.resolve.outputs.api_app }}" >> "$GITHUB_STEP_SUMMARY"
