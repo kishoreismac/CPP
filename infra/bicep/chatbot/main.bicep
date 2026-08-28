@@ -3,6 +3,9 @@ targetScope = 'resourceGroup'
 @description('Short workload name used in resource names.')
 param namePrefix string = 'cpp'
 
+@description('Stable generation identifier used to create a separate chatbot resource set without changing names on every deployment.')
+param resourceGeneration string = 'bicep2'
+
 @allowed([
   'dev'
   'test'
@@ -45,19 +48,26 @@ param publicNetworkAccess bool = true
 
 param tags object = {}
 
-var suffix = uniqueString(subscription().subscriptionId, resourceGroup().id, namePrefix, environment)
+var suffix = uniqueString(
+  subscription().subscriptionId,
+  resourceGroup().id,
+  namePrefix,
+  environment,
+  resourceGeneration
+)
 var normalizedPrefix = toLower(replace(namePrefix, '-', ''))
 var commonTags = union(tags, {
   application: 'CPP Order Management Portal'
   component: 'chatbot'
   environment: environment
   'managed-by': 'bicep'
+  resourceGeneration: resourceGeneration
 })
 
 module ai 'modules/azure-openai.bicep' = {
   name: 'chatbot-ai-${uniqueString(deployment().name)}'
   params: {
-    accountName: 'oai-${namePrefix}-${environment}-${suffix}'
+    accountName: 'oai-${namePrefix}-${environment}-${resourceGeneration}-${suffix}'
     location: location
     modelDeploymentName: modelDeploymentName
     modelName: modelName
@@ -72,7 +82,7 @@ module ai 'modules/azure-openai.bicep' = {
 module vault 'modules/key-vault.bicep' = if (deployKeyVault) {
   name: 'chatbot-kv-${uniqueString(deployment().name)}'
   params: {
-    keyVaultName: take('kv-${normalizedPrefix}-${environment}-${suffix}', 24)
+    keyVaultName: take('kv-${normalizedPrefix}-${environment}-${resourceGeneration}-${suffix}', 24)
     location: location
     openAiAccountName: ai.outputs.accountName
     apiPrincipalId: apiPrincipalId

@@ -1,6 +1,7 @@
 using '../main.bicep'
 
 param namePrefix = 'cpp'
+param resourceGeneration = 'bicep2'
 param environment = 'dev'
 param location = 'eastus2'
 
