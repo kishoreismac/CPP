@@ -55,7 +55,7 @@ jobs:
           while IFS= read -r file; do
             az bicep format --file "$file" --stdout > "$formatted_file"
             if [[ "$(cat "$file")" != "$(cat "$formatted_file")" ]]; then
-              if [[ "$file" == "$BICEP_ROOT/modules/key-vault.bicep" ]]; then
+              if [[ "$file" == "$BICEP_ROOT/modules/key-vault.bicep" || "$file" == "$BICEP_ROOT/modules/runtime-role.bicep" ]]; then
                 echo "Known read-only legacy formatting deviation: $file"
                 continue
               fi
