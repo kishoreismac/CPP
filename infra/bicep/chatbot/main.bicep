@@ -76,6 +76,7 @@ module vault 'modules/key-vault.bicep' = if (deployKeyVault) {
     location: location
     openAiAccountName: ai.outputs.accountName
     apiPrincipalId: apiPrincipalId
+    logAnalyticsWorkspaceResourceId: logAnalyticsWorkspaceResourceId
     publicNetworkAccess: publicNetworkAccess
     tags: commonTags
   }
@@ -93,7 +94,6 @@ module diagnostics 'modules/diagnostics.bicep' = if (!empty(logAnalyticsWorkspac
   name: 'chatbot-diagnostics-${uniqueString(deployment().name)}'
   params: {
     cognitiveAccountName: ai.outputs.accountName
-    keyVaultName: deployKeyVault ? vault!.outputs.keyVaultName : ''
     logAnalyticsWorkspaceResourceId: logAnalyticsWorkspaceResourceId
   }
 }

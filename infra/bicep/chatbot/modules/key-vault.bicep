@@ -2,6 +2,7 @@ param keyVaultName string
 param location string
 param openAiAccountName string
 param apiPrincipalId string
+param logAnalyticsWorkspaceResourceId string
 param publicNetworkAccess bool
 param tags object
 
@@ -39,6 +40,27 @@ resource openAiApiKey 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = {
   properties: {
     contentType: 'Azure OpenAI API key'
     value: openAi.listKeys().key1
+  }
+}
+
+resource diagnosticSetting 'Microsoft.Insights/diagnosticSettings@2021-05-01-preview' = if (!empty(logAnalyticsWorkspaceResourceId)) {
+  name: 'send-to-log-analytics'
+  scope: vault
+  properties: {
+    workspaceId: logAnalyticsWorkspaceResourceId
+    logAnalyticsDestinationType: 'Dedicated'
+    logs: [
+      {
+        categoryGroup: 'audit'
+        enabled: true
+      }
+    ]
+    metrics: [
+      {
+        category: 'AllMetrics'
+        enabled: true
+      }
+    ]
   }
 }
 
