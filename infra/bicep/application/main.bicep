@@ -22,6 +22,7 @@ param appServiceSku string = 'B1'
 param apiImageTag string = 'latest'
 param webImageTag string = 'latest'
 param mockJdeFailSubmissions bool = false
+param storageaccountname string = 'keudemosto111'
 
 @minValue(30)
 param logRetentionDays int = 30
