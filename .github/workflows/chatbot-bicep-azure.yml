@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - "infra/bicep/chatbot/**"
+      - "bicepconfig.json"
       - ".github/ps-rule-chatbot.yaml"
       - ".github/workflows/chatbot-bicep-azure.yml"
   push:
@@ -13,6 +14,7 @@ on:
       - 'feature/**'
     paths:
       - "infra/bicep/chatbot/**"
+      - "bicepconfig.json"
       - ".github/ps-rule-chatbot.yaml"
       - ".github/workflows/chatbot-bicep-azure.yml"
 
@@ -82,8 +84,12 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Lint chatbot Bicep
-        run: az bicep lint --file "$BICEP_ROOT/main.bicep"
+      - name: Lint chatbot Bicep with repository analyzer configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Using analyzer configuration: $(realpath bicepconfig.json)"
+          az bicep lint --file "$BICEP_ROOT/main.bicep"
 
   checkov:
     name: 4. Chatbot Checkov (depends on lint)

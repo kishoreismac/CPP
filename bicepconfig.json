@@ -1,0 +1,30 @@
+{
+  "analyzers": {
+    "core": {
+      "enabled": true,
+      "verbose": true,
+      "rules": {
+        "use-recent-api-versions": {
+          "level": "warning",
+          "maxAgeInDays": 730,
+          "gracePeriodInDays": 90
+        },
+        "no-hardcoded-env-urls": {
+          "level": "warning"
+        },
+        "no-unused-params": {
+          "level": "warning"
+        },
+        "no-unused-vars": {
+          "level": "warning"
+        },
+        "outputs-should-not-contain-secrets": {
+          "level": "warning"
+        },
+        "secure-parameter-default": {
+          "level": "warning"
+        }
+      }
+    }
+  }
+}

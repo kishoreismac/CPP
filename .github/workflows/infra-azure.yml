@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - "infra/bicep/application/**"
+      - "bicepconfig.json"
       - ".github/workflows/infra-azure.yml"
   push:
     branches:
@@ -12,6 +13,7 @@ on:
       - 'feature/**'
     paths:
       - "infra/bicep/application/**"
+      - "bicepconfig.json"
       - ".github/workflows/infra-azure.yml"
 
 permissions:
@@ -75,8 +77,12 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Lint Bicep
-        run: az bicep lint --file "$BICEP_ROOT/main.bicep"
+      - name: Lint Bicep with repository analyzer configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Using analyzer configuration: $(realpath bicepconfig.json)"
+          az bicep lint --file "$BICEP_ROOT/main.bicep"
 
   checkov:
     name: 4. Checkov (depends on lint)
